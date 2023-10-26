@@ -166,7 +166,6 @@ func (zr *ZoneResource) minMembers(pod *corev1.Pod) int {
 	return int(pg.Spec.MinMember)
 }
 
-// TODO: remove as part of cleanup for not using queue label.
 func (zr *ZoneResource) scoreForQueue(podInfo *framework.QueuedPodInfo) int {
 	var val int
 	switch podInfo.Pod.Annotations["habana.ai/queue"] {
@@ -253,8 +252,8 @@ func (zr *ZoneResource) Filter(ctx context.Context, state *framework.CycleState,
 	}
 
 	// If user provided his own zone selector, it's his responsability
-	if zr.hasZoneAffinity(pod) {
-		klog.V(4).InfoS("User provided zone selector", "pod", pod.Name)
+	if zr.hasZoneAffinity(pod) || zr.hasNodeSelectors(pod) {
+		klog.V(4).InfoS("User provided specific selector", "pod", pod.Name)
 		return framework.NewStatus(framework.Success)
 	}
 
@@ -417,6 +416,26 @@ func (zr *ZoneResource) Score(ctx context.Context, state *framework.CycleState, 
 
 	// nil is considered succcess
 	return nodeScore, nil
+}
+
+func (zr *ZoneResource) hasNodeSelectors(pod *corev1.Pod) bool {
+	if pod.Spec.Affinity != nil {
+		if pod.Spec.Affinity.NodeAffinity != nil {
+			required := pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+			if required != nil {
+				for _, term := range required.NodeSelectorTerms {
+					for _, expr := range term.MatchExpressions {
+						if expr.Key == "kubernetes.io/hostname" {
+							klog.V(5).InfoS("User selected specific hosts", "pod", pod.Name, "affinity", expr.String())
+							return true
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return false
 }
 
 func (zr *ZoneResource) hasZoneAffinity(pod *corev1.Pod) bool {
