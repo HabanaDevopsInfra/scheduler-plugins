@@ -81,6 +81,7 @@ local-image: clean
 	docker build -f ./build/controller/Dockerfile --build-arg ARCH="amd64" -t $(LOCAL_REGISTRY)/$(LOCAL_CONTROLLER_IMAGE) .
 	docker push $(LOCAL_REGISTRY)/$(LOCAL_CONTROLLER_IMAGE)
 	docker push $(LOCAL_REGISTRY)/$(LOCAL_IMAGE)
+	echo 'image: $(LOCAL_REGISTRY)/$(LOCAL_IMAGE)' > current_image.yaml
 
 .PHONY: release-image.amd64
 release-image.amd64: clean

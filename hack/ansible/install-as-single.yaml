@@ -6,6 +6,11 @@
   serial: 1
   tasks:
 
+  - name: Set image version
+    ansible.builtin.include_vars:
+      file: ../../current_image.yaml
+      name: image
+
   - name: Create new scheduler config
     copy:
       dest: /etc/kubernetes/sched-cc.yaml

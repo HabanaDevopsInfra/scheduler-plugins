@@ -1,0 +1,1 @@
+image: artifactory-kfs.habana-labs.com/k8s-infra-docker-dev/github/scheduler-plugins/kube-scheduler:v0.23.31
