@@ -355,3 +355,88 @@ func TestShouldClean(t *testing.T) {
 		})
 	}
 }
+
+func TestHasNodeSelector(t *testing.T) {
+	zr := &ZoneResource{}
+	t.Run("returns true when user want one host", func(t *testing.T) {
+		p := &corev1.Pod{
+			Spec: corev1.PodSpec{
+				Affinity: &corev1.Affinity{
+					NodeAffinity: &corev1.NodeAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+							NodeSelectorTerms: []corev1.NodeSelectorTerm{
+								{
+									MatchExpressions: []corev1.NodeSelectorRequirement{
+										{
+											Key:      "kubernetes.io/hostname",
+											Operator: corev1.NodeSelectorOpExists,
+											Values:   []string{"some-host"},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		if got, want := zr.hasNodeSelectors(p), true; got != want {
+			t.Errorf("got %t, want %t", got, want)
+		}
+	})
+	t.Run("returns true when in selector is used", func(t *testing.T) {
+		p := &corev1.Pod{
+			Spec: corev1.PodSpec{
+				Affinity: &corev1.Affinity{
+					NodeAffinity: &corev1.NodeAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+							NodeSelectorTerms: []corev1.NodeSelectorTerm{
+								{
+									MatchExpressions: []corev1.NodeSelectorRequirement{
+										{
+											Key:      "kubernetes.io/hostname",
+											Operator: corev1.NodeSelectorOpIn,
+											Values:   []string{"some-host"},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		if got, want := zr.hasNodeSelectors(p), true; got != want {
+			t.Errorf("got %t, want %t", got, want)
+		}
+	})
+	t.Run("returns false when user excluded host", func(t *testing.T) {
+		p := &corev1.Pod{
+			Spec: corev1.PodSpec{
+				Affinity: &corev1.Affinity{
+					NodeAffinity: &corev1.NodeAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+							NodeSelectorTerms: []corev1.NodeSelectorTerm{
+								{
+									MatchExpressions: []corev1.NodeSelectorRequirement{
+										{
+											Key:      "kubernetes.io/hostname",
+											Operator: corev1.NodeSelectorOpNotIn,
+											Values:   []string{"some-host"},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		if got, want := zr.hasNodeSelectors(p), false; got != want {
+			t.Errorf("got %t, want %t", got, want)
+		}
+	})
+}

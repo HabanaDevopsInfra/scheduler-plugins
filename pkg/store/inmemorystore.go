@@ -43,8 +43,8 @@ func (s *InMemoryStore) Add(key, val string, ts time.Time) bool {
 }
 
 func (s *InMemoryStore) Get(key string) (PgInfo, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	_, ok := s.data[key]
 	if !ok {
@@ -55,8 +55,8 @@ func (s *InMemoryStore) Get(key string) (PgInfo, error) {
 }
 
 func (s *InMemoryStore) Has(key string) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	_, ok := s.data[key]
 	return ok

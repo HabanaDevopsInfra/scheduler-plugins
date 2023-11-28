@@ -111,7 +111,7 @@
 
   - name: Apply cosched and all-in-one yamls
     ansible.builtin.shell:
-      cmd: kubectl apply -f {{ item }}
+      cmd: kubectl create -f {{ item }}
     loop:
     - /tmp/crd.yaml
     - /tmp/eq.yaml

@@ -110,6 +110,7 @@ func (cs *Coscheduling) Name() string {
 // 2. Compare the initialization timestamps of PodGroups or Pods.
 // 3. Compare the keys of PodGroups/Pods: <namespace>/<podname>.
 func (cs *Coscheduling) Less(podInfo1, podInfo2 *framework.QueuedPodInfo) bool {
+	// klog.V(5).Infof("Less(): comparing pod %s with %s", podInfo1.Pod.Name, podInfo2.Pod.Name)
 	prio1 := corev1helpers.PodPriority(podInfo1.Pod)
 	prio2 := corev1helpers.PodPriority(podInfo2.Pod)
 	if prio1 != prio2 {

@@ -285,6 +285,16 @@ func (zr *ZoneResource) Filter(ctx context.Context, state *framework.CycleState,
 
 		siteAffinity, _ := zr.hasSiteAffinity(pod)
 
+		// Check if the pod is member of a podgroup, is yes, get its members and check
+		// if the a zone was already attached to one of the pod.
+		var selectedZone string
+		pgInfo, err := zr.store.Get(pgName)
+		if err != nil {
+			klog.ErrorS(err, "Retrieve pod group from store", "pod", pod.Name, "podgroup", pgName)
+		}
+		selectedZone = pgInfo.Zone
+		klog.V(4).Infof("after group check for pod %s, selected zone is: %s", pod.Name, selectedZone)
+
 		// Get zones and their free cards
 		zones, err := zr.zones(nodeInfo, *pod.Spec.Priority, podHLResource, reqResourceVal, pod.Labels["habana.ai/schedulable"], siteAffinity)
 		if err != nil {
@@ -316,21 +326,11 @@ func (zr *ZoneResource) Filter(ctx context.Context, state *framework.CycleState,
 
 		// Is PG Already scheduled
 
-		// Check if the pod is member of a podgroup, is yes, get its members and check
-		// if the a zone was already attached to one of the pod.
-		var selectedZone string
-		pgInfo, err := zr.store.Get(pgName)
-		if err != nil {
-			klog.ErrorS(err, "Retrieve pod group from store", "pod", pod.Name, "podgroup", pgName)
-		}
-		selectedZone = pgInfo.Zone
-		klog.V(4).Infof("after group check for pod %s, selected zone is: %s", pod.Name, selectedZone)
-
 		// if not, check if the node belongs to a free zone that can fit the members
 		reqNodeZone := nodeInfo.Node().Labels[zr.zoneLabel]
 		if selectedZone == "" {
 			for _, zone := range orederedZones {
-				klog.Infof("Pod group %s needs %d cards, zone %s has %d free cards", pgName, totalCards, zone, zones[zone])
+				klog.Infof("Pod group %s needs %d cards, zone %s has %d free cards", pgName, totalCards, zone, zones[zone].freeCards)
 				if zones[zone].freeCards >= totalCards {
 					selectedZone = zone
 					zr.store.Add(pgName, zone, timeNow())
@@ -425,7 +425,8 @@ func (zr *ZoneResource) hasNodeSelectors(pod *corev1.Pod) bool {
 			if required != nil {
 				for _, term := range required.NodeSelectorTerms {
 					for _, expr := range term.MatchExpressions {
-						if expr.Key == "kubernetes.io/hostname" {
+						// Skip when users requests for a specific hosts using = or 'in'. In cases he uses 'not in' or '!=' to exclude host(s) we continue.
+						if expr.Key == "kubernetes.io/hostname" && expr.Operator != corev1.NodeSelectorOpDoesNotExist && expr.Operator != corev1.NodeSelectorOpNotIn {
 							klog.V(5).InfoS("User selected specific hosts", "pod", pod.Name, "affinity", expr.String())
 							return true
 						}

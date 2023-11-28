@@ -162,7 +162,6 @@ func cmp(x, y *framework.Resource) bool {
 	return cmp2(x, &framework.Resource{}, y)
 }
 
-// TODO: PR to main repo
 func cmp2(request, used, boundary *framework.Resource) bool {
 
 	// Loop through all the resources of the boundary (min/max) and check if the request +

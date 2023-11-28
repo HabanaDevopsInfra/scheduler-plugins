@@ -22,13 +22,13 @@ export DOCKER_BUILDKIT=1
 # RELEASE_REGISTRY is the container registry to push
 # into. The default is to push to the staging
 # registry, not production(k8s.gcr.io).
-RELEASE_REGISTRY?=artifactory-kfs.habana-labs.com/k8s-infra-docker-dev/habana/scheduler-plugins
+RELEASE_REGISTRY?=artifactory-kfs.habana-labs.com/k8s-infra-docker-dev/github/scheduler-plugins
 # RELEASE_VERSION?=v$(shell date +%Y%m%d)-v0.23.10
-RELEASE_VERSION?=v0.23.29
+RELEASE_VERSION?=v0.23.31
 RELEASE_IMAGE:=kube-scheduler:$(RELEASE_VERSION)
 RELEASE_CONTROLLER_IMAGE:=controller:$(RELEASE_VERSION)
 
-LOCAL_REGISTRY=artifactory-kfs.habana-labs.com/k8s-infra-docker-dev/habana/scheduler-plugins
+LOCAL_REGISTRY=artifactory-kfs.habana-labs.com/k8s-infra-docker-dev/github/scheduler-plugins
 LOCAL_IMAGE=kube-scheduler:$(RELEASE_VERSION)
 LOCAL_CONTROLLER_IMAGE=controller:$(RELEASE_VERSION)
 
