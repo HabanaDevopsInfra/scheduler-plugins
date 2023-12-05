@@ -25,7 +25,10 @@ import (
 	"sigs.k8s.io/scheduler-plugins/pkg/util"
 )
 
-const Name = "ZoneResource"
+const (
+	Name                 = "ZoneResource"
+	AnnotationStrictZone = "habana.ai/strict_zone"
+)
 
 // ZoneResource is a pluging that schedule pods in a zone based on resource
 type ZoneResource struct {
@@ -258,7 +261,7 @@ func (zr *ZoneResource) Filter(ctx context.Context, state *framework.CycleState,
 
 	pgName := util.GetPodGroupLabel(pod)
 	// We filter out zones only if the user asked for it explicitly
-	if pod.Annotations["habana.ai/strict_zone"] == "true" {
+	if pod.Annotations[AnnotationStrictZone] == "true" {
 
 		// Get zone information from state
 		rawZoneData, err := state.Read(framework.StateKey(pgName))
@@ -315,7 +318,7 @@ func (zr *ZoneResource) selectZone(pod *corev1.Pod) (string, error) {
 
 	siteAffinity, _ := zr.hasSiteAffinity(pod)
 
-	// Check if the pod is member of a podgroup, is yes, get its members and check
+	// Check if the pod is member of a podgroup, if yes, get its members and check
 	// if the a zone was already attached to one of the pod.
 	var selectedZone string
 	pgInfo, err := zr.store.Get(pgName)
