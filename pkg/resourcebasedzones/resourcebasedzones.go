@@ -202,10 +202,14 @@ func (zr *ZoneResource) PreFilter(ctx context.Context, state *framework.CycleSta
 		return framework.NewStatus(framework.Error, err.Error())
 	}
 
+	// Add selected zone to cycle context for filter func.
 	state.Write(framework.StateKey(pgName), &pgData{
 		zone: selectedZone,
 		skip: false,
 	})
+
+	// Add to cache for selectZone to know zone already selected for another member.
+	zr.store.Add(pgName, selectedZone, time.Now())
 
 	klog.Infof("selected zone for pod group %s: %s", pgName, selectedZone)
 	return framework.NewStatus(framework.Success, "")
