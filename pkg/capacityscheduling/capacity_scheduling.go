@@ -737,7 +737,18 @@ func (c *CapacityScheduling) updatePod(oldObj, newObj interface{}) {
 }
 
 func (c *CapacityScheduling) deletePod(obj interface{}) {
-	pod := obj.(*v1.Pod)
+	var pod *v1.Pod
+	switch t := obj.(type) {
+	case *v1.Pod:
+		pod = t
+	case cache.DeletedFinalStateUnknown:
+		if p, ok := t.Obj.(*v1.Pod); ok {
+			pod = p
+		}
+	default:
+		klog.ErrorS(fmt.Errorf("expected type %q, got %T", pod, obj), "Not a pod")
+		return
+	}
 	c.Lock()
 	defer c.Unlock()
 
@@ -814,20 +825,21 @@ func getPodDisruptionBudgets(pdbLister policylisters.PodDisruptionBudgetLister) 
 // Example:
 //
 // Pod:
-//   InitContainers
-//     IC1:
-//       CPU: 2
-//       Memory: 1G
-//     IC2:
-//       CPU: 2
-//       Memory: 3G
-//   Containers
-//     C1:
-//       CPU: 2
-//       Memory: 1G
-//     C2:
-//       CPU: 1
-//       Memory: 1G
+//
+//	InitContainers
+//	  IC1:
+//	    CPU: 2
+//	    Memory: 1G
+//	  IC2:
+//	    CPU: 2
+//	    Memory: 3G
+//	Containers
+//	  C1:
+//	    CPU: 2
+//	    Memory: 1G
+//	  C2:
+//	    CPU: 1
+//	    Memory: 1G
 //
 // Result: CPU: 3, Memory: 3G
 func computePodResourceRequest(pod *v1.Pod) *framework.Resource {
