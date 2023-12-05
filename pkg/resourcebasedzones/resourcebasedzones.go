@@ -2,6 +2,7 @@ package resourcebasedzones
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -24,8 +25,10 @@ import (
 	"sigs.k8s.io/scheduler-plugins/pkg/util"
 )
 
-const Name = "ZoneResource"
-const driverLabel = "habana.ai/hl_driver_version"
+const (
+	Name                 = "ZoneResource"
+	AnnotationStrictZone = "habana.ai/strict_zone"
+)
 
 // ZoneResource is a pluging that schedule pods in a zone based on resource
 type ZoneResource struct {
@@ -84,7 +87,7 @@ func (zr *ZoneResource) Name() string {
 // 4. Compare the initialization timestamps of PodGroups or Pods.
 // 5. Compare the namespace+podname
 func (zr *ZoneResource) Less(podInfo1, podInfo2 *framework.QueuedPodInfo) bool {
-	klog.V(5).Infof(
+	klog.V(6).Infof(
 		"Less(): comparing pod %s [%d] with %s [%d]", podInfo1.Pod.Name, podInfo1.Attempts,
 		podInfo2.Pod.Name, podInfo2.Attempts,
 	)
@@ -186,37 +189,32 @@ func (zr *ZoneResource) PreFilter(ctx context.Context, state *framework.CycleSta
 	// Get Pod Group
 	pgName := pod.Labels[v1alpha1.PodGroupLabel]
 
-	// Check its creation time. If the interval passed, clean the cache
-	if zr.shouldClean(pgName) {
+	// SelectZone for pod
+	selectedZone, err := zr.selectZone(pod)
+	if err != nil {
 
-		// Clean from group members any node they already have
-		cleanedAll := true
-		zr.frameworkHandler.IterateOverWaitingPods(func(wp framework.WaitingPod) {
-			if wp.GetPod().Labels[v1alpha1.PodGroupLabel] == pgName {
-				klog.V(4).Infof("cleaning selected node from pod %s [%s]", wp.GetPod().Name, pgName)
-				if err := zr.frameworkHandler.ClientSet().CoreV1().Pods(wp.GetPod().Namespace).Bind(ctx, &corev1.Binding{
-					ObjectMeta: metav1.ObjectMeta{
-						Namespace: wp.GetPod().Namespace,
-						Name:      wp.GetPod().Name,
-					},
-					Target: corev1.ObjectReference{
-						APIVersion: "v1",
-						Kind:       "Node",
-						Name:       "",
-					},
-				}, metav1.CreateOptions{}); err != nil {
-					klog.V(4).ErrorS(err, "Failed node cleanup on pod", "pod", wp.GetPod().Name)
-					cleanedAll = false
-				}
-			}
-		})
-		if cleanedAll {
-			klog.V(4).Infof("prefilter: Removed podgroup %s from cache", pgName)
-			zr.store.Delete(pgName)
+		// Populate cycle data for the Filter stage to skip the checks
+		if errors.Is(err, ErrSkipZone) {
+			state.Write(framework.StateKey(pgName), &pgData{
+				zone: "",
+				skip: true,
+			})
+			return nil
 		}
-
+		klog.ErrorS(err, "prefilter selecting zone")
+		return framework.NewStatus(framework.Error, err.Error())
 	}
 
+	// Add selected zone to cycle context for filter func.
+	state.Write(framework.StateKey(pgName), &pgData{
+		zone: selectedZone,
+		skip: false,
+	})
+
+	// Add to cache for selectZone to know zone already selected for another member.
+	zr.store.Add(pgName, selectedZone, time.Now())
+
+	klog.Infof("selected zone for pod group %s: %s", pgName, selectedZone)
 	return framework.NewStatus(framework.Success, "")
 }
 
@@ -244,8 +242,8 @@ func (zr *ZoneResource) Filter(ctx context.Context, state *framework.CycleState,
 	if nodeInfo.Node() == nil {
 		return framework.NewStatus(framework.Error, "node not found")
 	}
+
 	// If pod is not habana resource, skip
-	// TODO: add worker_node label to workers and check for it
 	if _, ok := pod.Labels["habana.ai/user"]; !ok {
 		klog.V(4).Info("non habana workload, skipping")
 		return framework.NewStatus(framework.Success)
@@ -260,103 +258,115 @@ func (zr *ZoneResource) Filter(ctx context.Context, state *framework.CycleState,
 	klog.V(4).Infof("zone resource: pod: %s is trying to fit on node %s", pod.Name, nodeInfo.Node().Name)
 
 	// ############################################################
-	// Driver check
-	podHLResource := zr.habanaResourceName(pod)
-	if podHLResource == "" {
-		klog.V(4).Info("no card resource request")
-		return nil
-	}
-	reqResourceVal := reqHabanaResource(podHLResource, pod)
 
-	// Block Driver version 1.10 on idc
-	driverSemVer := pod.Annotations["habana.ai/release-build"]
-	if strings.HasPrefix(driverSemVer, "1.10") && nodeInfo.Node().Labels["habana.ai/site"] == "idc" {
-		klog.InfoS("driver version 1.10.X cannot run on IDC site", "pod", pod.Name, "node", nodeInfo.Node().Name)
-		return framework.NewStatus(framework.UnschedulableAndUnresolvable, "driver version 1.10.X cannot run on IDC site")
-	}
-
-	// TODO: look for 8 value
+	pgName := util.GetPodGroupLabel(pod)
 	// We filter out zones only if the user asked for it explicitly
-	if pod.Annotations["habana.ai/strict_zone"] == "true" && reqResourceVal >= 8 {
-		klog.V(4).Info("entered strict zone checking")
+	if pod.Annotations[AnnotationStrictZone] == "true" {
 
-		pgName := pod.Labels[v1alpha1.PodGroupLabel]
-		klog.V(4).Infof("pod %s belongs to pod group: %s", pod.Name, pgName)
-
-		siteAffinity, _ := zr.hasSiteAffinity(pod)
-
-		// Check if the pod is member of a podgroup, is yes, get its members and check
-		// if the a zone was already attached to one of the pod.
-		var selectedZone string
-		pgInfo, err := zr.store.Get(pgName)
+		// Get zone information from state
+		rawZoneData, err := state.Read(framework.StateKey(pgName))
 		if err != nil {
-			klog.ErrorS(err, "Retrieve pod group from store", "pod", pod.Name, "podgroup", pgName)
-		}
-		selectedZone = pgInfo.Zone
-		klog.V(4).Infof("after group check for pod %s, selected zone is: %s", pod.Name, selectedZone)
-
-		// Get zones and their free cards
-		zones, err := zr.zones(nodeInfo, *pod.Spec.Priority, podHLResource, reqResourceVal, pod.Labels["habana.ai/schedulable"], siteAffinity)
-		if err != nil {
-			msg := fmt.Sprintf("failed calculating zones: %s", err.Error())
-			return framework.NewStatus(framework.Error, msg)
-		}
-
-		// Log for verbosity
-		for name, info := range zones {
-			klog.V(4).Infof("Zone '%s' has %d free cards, possible preemption %d", name, info.freeCards, info.ToPreempt)
-		}
-
-		// Get total requested cards of the pod's group.
-		totalCards, err := zr.totalGroupRequest(reqResourceVal, pgName)
-		if err != nil {
-			klog.Error(err)
+			if errors.Is(err, framework.ErrNotFound) {
+				return framework.NewStatus(framework.Unschedulable, "no zone data found")
+			}
 			return framework.NewStatus(framework.Error, err.Error())
 		}
-		klog.V(4).Infof("Total request card for %s: %d", pgName, totalCards)
 
-		var orederedZones []string
-		if *pod.Spec.Priority > 0 {
-			// Order of least preemptable
-			orederedZones = zoneLessPreempt(zones)
-		} else {
-			// Order zone from the least free to most free by cards
-			orederedZones = zoneFreeAsc(zones)
+		zoneData, ok := rawZoneData.(*pgData)
+		if !ok {
+			// Not expecting this case, but if happen retry the pod.
+			if errors.Is(err, framework.ErrNotFound) {
+				return framework.NewStatus(framework.Unschedulable, "no zone data found")
+			}
 		}
 
-		// Is PG Already scheduled
-
-		// if not, check if the node belongs to a free zone that can fit the members
-		reqNodeZone := nodeInfo.Node().Labels[zr.zoneLabel]
-		if selectedZone == "" {
-			for _, zone := range orederedZones {
-				klog.Infof("Pod group %s needs %d cards, zone %s has %d free cards", pgName, totalCards, zone, zones[zone].freeCards)
-				if zones[zone].freeCards >= totalCards {
-					selectedZone = zone
-					zr.store.Add(pgName, zone, timeNow())
-				}
-			}
+		if zoneData.skip {
+			klog.Infof("skipping strict-zone for pod group: %s", pgName)
+			return framework.NewStatus(framework.Success)
 		}
 
 		zr.logPodGroup(pgName)
 
-		// If we didn't find a zone at all
-		if selectedZone == "" {
-			return framework.NewStatus(framework.Unschedulable, "No zone can fulfill the request")
-		}
+		reqNodeZone := nodeInfo.Node().Labels[zr.zoneLabel]
 
-		klog.V(4).Infof("Selected zone for pod %s is %s", pod.Name, selectedZone)
-		state.Write(framework.StateKey(pgName), &pgData{
-			zone: selectedZone,
-		})
 		// If the node is not in the selected zone, fail the request
-		if reqNodeZone != selectedZone {
-			klog.V(4).Infof("Not in the selected zone %s: %s [%s]", selectedZone, nodeInfo.Node().Name, reqNodeZone)
-			return framework.NewStatus(framework.Unschedulable, fmt.Sprintf("Not in the selected zone %s", selectedZone))
+		if reqNodeZone != zoneData.zone {
+			klog.V(4).Infof("Not in the selected zone %s: %s [%s]", zoneData.zone, nodeInfo.Node().Name, reqNodeZone)
+			return framework.NewStatus(framework.Unschedulable, fmt.Sprintf("Not in the selected zone %s", zoneData.zone))
 		}
 	}
 
 	return nil
+}
+
+var ErrSkipZone = errors.New("skipping strict-zone selection")
+
+func (zr *ZoneResource) selectZone(pod *corev1.Pod) (string, error) {
+	podHLResource := zr.habanaResourceName(pod)
+	if podHLResource == "" {
+		klog.V(4).Info("no card resource request")
+		return "", ErrSkipZone
+	}
+	reqResourceVal := reqHabanaResource(podHLResource, pod)
+	if reqResourceVal < 8 {
+		return "", ErrSkipZone
+	}
+	klog.V(4).Info("entered strict zone checking")
+
+	pgName := pod.Labels[v1alpha1.PodGroupLabel]
+	klog.V(4).Infof("pod %s belongs to pod group: %s", pod.Name, pgName)
+
+	siteAffinity, _ := zr.hasSiteAffinity(pod)
+
+	// Check if the pod is member of a podgroup, if yes, get its members and check
+	// if the a zone was already attached to one of the pod.
+	var selectedZone string
+	pgInfo, err := zr.store.Get(pgName)
+	if err != nil {
+		klog.ErrorS(err, "Retrieve pod group from store", "pod", pod.Name, "podgroup", pgName)
+	}
+	selectedZone = pgInfo.Zone
+	klog.V(4).Infof("after group check for pod %s, selected zone is: %s", pod.Name, selectedZone)
+
+	// Zone already selected for the group, we can return early.
+	if selectedZone != "" {
+		return selectedZone, nil
+	}
+
+	// Get zones and their free cards
+	zones, err := zr.zones(*pod.Spec.Priority, podHLResource, reqResourceVal, pod.Labels["habana.ai/schedulable"], siteAffinity)
+	if err != nil {
+		return "", fmt.Errorf("failed calculating zones: %s", err.Error())
+	}
+
+	// Log for verbosity
+	for name, info := range zones {
+		klog.V(4).Infof("Zone '%s' has %d free cards, possible preemption %d", name, info.freeCards, info.ToPreempt)
+	}
+
+	// Get total requested cards of the pod's group.
+	totalCards, err := zr.totalGroupRequest(reqResourceVal, pgName)
+	if err != nil {
+		return "", err
+	}
+	klog.V(4).Infof("Total request card for %s: %d", pgName, totalCards)
+
+	var orderedZones []string
+	if *pod.Spec.Priority > 0 {
+		// Order of least preemptable
+		orderedZones = zoneLessPreempt(zones)
+	} else {
+		// Order zone from the least free to most free by cards
+		orderedZones = zoneFreeAsc(zones)
+	}
+
+	for _, zone := range orderedZones {
+		if zones[zone].freeCards >= totalCards {
+			return zone, nil
+		}
+	}
+
+	return "", fmt.Errorf("no zone can fulfill the request")
 }
 
 func (zr *ZoneResource) logPodGroup(pgName string) {
@@ -515,7 +525,7 @@ type zoneInfo struct {
 	ToPreempt int
 }
 
-func (zr *ZoneResource) zones(nodeInfo *framework.NodeInfo, priority int32, resourceName corev1.ResourceName, requiredCards int, schedulable, siteAffinity string) (map[string]zoneInfo, error) {
+func (zr *ZoneResource) zones(priority int32, resourceName corev1.ResourceName, requiredCards int, schedulable, siteAffinity string) (map[string]zoneInfo, error) {
 	// zones is a map holding the zone (i.e a,b,c) and the number of the free cards
 	zones := make(map[string]zoneInfo)
 
@@ -710,6 +720,7 @@ func (zr *ZoneResource) totalGroupRequest(podReq int, pgName string) (int64, err
 
 type pgData struct {
 	zone string
+	skip bool
 }
 
 func (pd *pgData) Clone() framework.StateData {
