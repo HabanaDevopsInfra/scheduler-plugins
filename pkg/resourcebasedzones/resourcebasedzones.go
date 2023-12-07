@@ -189,6 +189,10 @@ func (zr *ZoneResource) PreFilter(ctx context.Context, state *framework.CycleSta
 	// Get Pod Group
 	pgName := pod.Labels[v1alpha1.PodGroupLabel]
 
+	if zr.shouldClean(pgName) {
+		zr.store.Delete(pgName)
+	}
+
 	// SelectZone for pod
 	selectedZone, err := zr.selectZone(pod)
 	if err != nil {
@@ -222,6 +226,7 @@ var (
 	timeNow = time.Now
 )
 
+// shouldClean returns true if pod group exists in cache more then allowed.
 func (zr *ZoneResource) shouldClean(pgName string) bool {
 	pgInfo, err := zr.store.Get(pgName)
 	if err != nil {
