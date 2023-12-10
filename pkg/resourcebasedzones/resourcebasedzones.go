@@ -254,8 +254,8 @@ func (zr *ZoneResource) Filter(ctx context.Context, state *framework.CycleState,
 		return framework.NewStatus(framework.Success)
 	}
 
-	// If user provided his own zone selector, it's his responsability
-	if zr.hasZoneAffinity(pod) || zr.hasNodeSelectors(pod) {
+	// If user provided his own node selector, it's his responsability
+	if zr.hasNodeSelectors(pod) {
 		klog.V(4).InfoS("User provided specific selector", "pod", pod.Name)
 		return framework.NewStatus(framework.Success)
 	}
@@ -365,6 +365,12 @@ func (zr *ZoneResource) selectZone(pod *corev1.Pod) (string, error) {
 		orderedZones = zoneFreeAsc(zones)
 	}
 
+	// Check if user provided zones, if so, filters the zone based on his selection.
+	userReqZones, ok := zr.userZoneAffinity(pod)
+	if ok {
+		orderedZones = intersection(orderedZones, userReqZones)
+	}
+
 	for _, zone := range orderedZones {
 		if zones[zone].freeCards >= totalCards {
 			return zone, nil
@@ -472,6 +478,42 @@ func (zr *ZoneResource) hasZoneAffinity(pod *corev1.Pod) bool {
 	}
 
 	return false
+}
+
+func (zr *ZoneResource) userZoneAffinity(pod *corev1.Pod) ([]string, bool) {
+	if pod.Spec.Affinity != nil {
+		if pod.Spec.Affinity.NodeAffinity != nil {
+			required := pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+			if required != nil {
+				for _, term := range required.NodeSelectorTerms {
+					for _, expr := range term.MatchExpressions {
+						if expr.Key == zr.zoneLabel && expr.Operator == corev1.NodeSelectorOpIn {
+							klog.V(5).InfoS("Pod has zone affinity", "pod", pod.Name, "affinity", expr.String())
+							return expr.Values, true
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return nil, false
+}
+
+// intersection returns the common elements in two arrays.
+func intersection(a, b []string) []string {
+	var ret []string
+	m := make(map[string]bool)
+
+	for _, item := range a {
+		m[item] = true
+	}
+	for _, item := range b {
+		if _, ok := m[item]; ok {
+			ret = append(ret, item)
+		}
+	}
+	return ret
 }
 
 // hasSiteAffinity checks is user provided selector for habana.ai/site and returns its value.
