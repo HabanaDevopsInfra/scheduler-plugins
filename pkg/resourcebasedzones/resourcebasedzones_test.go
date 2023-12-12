@@ -440,3 +440,83 @@ func TestHasNodeSelector(t *testing.T) {
 		}
 	})
 }
+
+func TestUserSelectedZones(t *testing.T) {
+	tests := []struct {
+		name string
+		pod  *corev1.Pod
+		want []string
+		ok   bool
+	}{
+		{
+			name: "user provide single zone returns ok",
+			pod:  podWithZoneSelector([]string{"a"}),
+			ok:   true,
+			want: []string{"a"},
+		},
+		{
+			name: "user provide two zones returns both values",
+			pod:  podWithZoneSelector([]string{"a", "b"}),
+			ok:   true,
+			want: []string{"a", "b"},
+		},
+		{
+			// Case when selector is basically exists
+			name: "user provide no zone returns ok and empty values",
+			pod:  podWithZoneSelector([]string{}),
+			ok:   true,
+			want: []string{},
+		},
+		{
+			name: "no zone selector returns false",
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					Affinity: &corev1.Affinity{},
+				},
+			},
+
+			ok:   false,
+			want: []string{},
+		},
+	}
+	zr := &ZoneResource{
+		zoneLabel: "habana.ai/zone",
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			zones, ok := zr.userZoneAffinity(tt.pod)
+			if ok != tt.ok {
+				t.Errorf("ok=%t, want %t", ok, tt.ok)
+			}
+			if tt.ok && !reflect.DeepEqual(zones, tt.want) {
+				t.Errorf("got zones %v, want %v", zones, tt.want)
+			}
+		})
+	}
+}
+
+func podWithZoneSelector(zones []string) *corev1.Pod {
+	p := &corev1.Pod{
+		Spec: corev1.PodSpec{
+			Affinity: &corev1.Affinity{
+				NodeAffinity: &corev1.NodeAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+						NodeSelectorTerms: []corev1.NodeSelectorTerm{
+							{
+								MatchExpressions: []corev1.NodeSelectorRequirement{
+									{
+										Key:      "habana.ai/zone",
+										Operator: corev1.NodeSelectorOpIn,
+										Values:   zones,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	return p
+}
