@@ -50,7 +50,7 @@
               ResourceNamespace: 'habana.ai/gaudi'
               ZoneLabel: 'habana.ai/zone'
               PriorityZones: {{ scheduler_priority_zones }}
-              CleanupInterval: 1
+              CleanupInterval: 5
         - schedulerName: default-scheduler
           plugins:
             queueSort:
@@ -98,7 +98,7 @@
               ResourceNamespace: 'habana.ai/gaudi'
               ZoneLabel: 'habana.ai/zone'
               PriorityZones: {{ scheduler_priority_zones }}
-              CleanupInterval: 1
+              CleanupInterval: 5
           - name: NodeResourcesFit
             args:
               scoringStrategy:
