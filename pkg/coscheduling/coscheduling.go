@@ -244,9 +244,6 @@ func (cs *Coscheduling) Unreserve(ctx context.Context, state *framework.CycleSta
 		}
 	})
 	cs.pgMgr.DeletePermittedPodGroup(pgName)
-
-	// Cleanup the selected zone from the state to allow re-selection of zones.
-	state.Delete(framework.StateKey(pgName))
 }
 
 // PostBind is called after a pod is successfully bound. These plugins are used update PodGroup when pod is bound.
