@@ -310,10 +310,11 @@ func (zr *ZoneResource) selectZone(state *framework.CycleState, pod *corev1.Pod)
 		klog.V(4).Info("no card resource request")
 		return "", ErrSkipZone
 	}
+	// TODO: consider flavors with lessthan 8, actually y do we care
 	reqResourceVal := reqHabanaResource(podHLResource, pod)
-	if reqResourceVal < 8 {
-		return "", ErrSkipZone
-	}
+	// if reqResourceVal == 1 {
+	// 	return "", ErrSkipZone
+	// }
 	klog.V(4).Info("entered strict zone checking", "pod", pod.Name)
 
 	pgName := pod.Labels[v1alpha1.PodGroupLabel]
