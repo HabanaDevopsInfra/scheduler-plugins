@@ -365,10 +365,12 @@ func (zr *ZoneResource) selectZone(state *framework.CycleState, pod *corev1.Pod)
 		orderedZones = zoneFreeAsc(zones)
 	}
 
+	klog.V(4).InfoS("Zones before intersection", "zones", orderedZones, "podgroup", pgName)
 	// Check if user provided zones, if so, filters the zone based on his selection.
 	userReqZones, ok := zr.userZoneAffinity(pod)
 	if ok {
 		orderedZones = intersection(orderedZones, userReqZones)
+		klog.V(4).InfoS("Zones before intersection", "zones", orderedZones, "podgroup", pgName)
 	}
 
 	for _, zone := range orderedZones {
