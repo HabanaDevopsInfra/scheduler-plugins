@@ -28,6 +28,8 @@ import (
 const (
 	Name                 = "ZoneResource"
 	AnnotationStrictZone = "habana.ai/strict_zone"
+	LabelMPIJobRole      = "training.kubeflow.org/job-role"
+	RoleLauncher         = "launcher"
 )
 
 // ZoneResource is a pluging that schedule pods in a zone based on resource
@@ -186,26 +188,30 @@ func (zr *ZoneResource) scoreForQueue(podInfo *framework.QueuedPodInfo) int {
 // PreFilter cleans the in-memory cache for a pod group that was added more than 5 minutes ago
 // and still was not scheduled
 func (zr *ZoneResource) PreFilter(ctx context.Context, state *framework.CycleState, pod *corev1.Pod) *framework.Status {
+
+	// If pod is not habana resource or launcher, skip
+	if _, ok := pod.Labels["habana.ai/user"]; !ok || isLauncher(pod) {
+		klog.V(4).Info("non habana workload or mpi-launcher, skipping")
+		return framework.NewStatus(framework.Success)
+	}
+
 	// Get Pod Group
 	pgName := pod.Labels[v1alpha1.PodGroupLabel]
 
-	if zr.shouldClean(pgName) {
-		zr.store.Delete(pgName)
-	}
-
 	// SelectZone for pod
-	selectedZone, err := zr.selectZone(pod)
+	selectedZone, err := zr.selectZone(state, pod)
 	if err != nil {
 
 		// Populate cycle data for the Filter stage to skip the checks
 		if errors.Is(err, ErrSkipZone) {
+			klog.V(4).InfoS("prefilter: Error Skipping zone", "podgroup", pgName, "pod", pod.Name)
 			state.Write(framework.StateKey(pgName), &pgData{
 				zone: "",
 				skip: true,
 			})
 			return nil
 		}
-		klog.ErrorS(err, "prefilter selecting zone")
+		klog.ErrorS(err, "prefilter selecting zone", "podgroup", pgName)
 		return framework.NewStatus(framework.Error, err.Error())
 	}
 
@@ -215,7 +221,7 @@ func (zr *ZoneResource) PreFilter(ctx context.Context, state *framework.CycleSta
 		skip: false,
 	})
 
-	// Add to cache for selectZone to know zone already selected for another member.
+	// Cache for the lifetype of pods, and not just for scheduling context.
 	zr.store.Add(pgName, selectedZone, time.Now())
 
 	klog.Infof("selected zone for pod group %s: %s", pgName, selectedZone)
@@ -249,8 +255,8 @@ func (zr *ZoneResource) Filter(ctx context.Context, state *framework.CycleState,
 	}
 
 	// If pod is not habana resource, skip
-	if _, ok := pod.Labels["habana.ai/user"]; !ok {
-		klog.V(4).Info("non habana workload, skipping")
+	if _, ok := pod.Labels["habana.ai/user"]; !ok || isLauncher(pod) {
+		klog.V(4).Info("non habana workload or mpi-launcher, skipping")
 		return framework.NewStatus(framework.Success)
 	}
 
@@ -269,7 +275,7 @@ func (zr *ZoneResource) Filter(ctx context.Context, state *framework.CycleState,
 	if pod.Annotations[AnnotationStrictZone] == "true" {
 
 		// Get zone information from state
-		rawZoneData, err := state.Read(framework.StateKey(pgName))
+		zoneData, err := extractZoneData(state, pgName)
 		if err != nil {
 			if errors.Is(err, framework.ErrNotFound) {
 				return framework.NewStatus(framework.Unschedulable, "no zone data found")
@@ -277,16 +283,8 @@ func (zr *ZoneResource) Filter(ctx context.Context, state *framework.CycleState,
 			return framework.NewStatus(framework.Error, err.Error())
 		}
 
-		zoneData, ok := rawZoneData.(*pgData)
-		if !ok {
-			// Not expecting this case, but if happen retry the pod.
-			if errors.Is(err, framework.ErrNotFound) {
-				return framework.NewStatus(framework.Unschedulable, "no zone data found")
-			}
-		}
-
 		if zoneData.skip {
-			klog.Infof("skipping strict-zone for pod group: %s", pgName)
+			klog.InfoS("skipping strict-zone for pod group", "podgroup", pgName, "pod", pod.Name)
 			return framework.NewStatus(framework.Success)
 		}
 
@@ -306,17 +304,18 @@ func (zr *ZoneResource) Filter(ctx context.Context, state *framework.CycleState,
 
 var ErrSkipZone = errors.New("skipping strict-zone selection")
 
-func (zr *ZoneResource) selectZone(pod *corev1.Pod) (string, error) {
+func (zr *ZoneResource) selectZone(state *framework.CycleState, pod *corev1.Pod) (string, error) {
 	podHLResource := zr.habanaResourceName(pod)
 	if podHLResource == "" {
 		klog.V(4).Info("no card resource request")
 		return "", ErrSkipZone
 	}
+	// TODO: consider flavors with lessthan 8, actually y do we care
 	reqResourceVal := reqHabanaResource(podHLResource, pod)
-	if reqResourceVal < 8 {
-		return "", ErrSkipZone
-	}
-	klog.V(4).Info("entered strict zone checking")
+	// if reqResourceVal == 1 {
+	// 	return "", ErrSkipZone
+	// }
+	klog.V(4).Info("entered strict zone checking", "pod", pod.Name)
 
 	pgName := pod.Labels[v1alpha1.PodGroupLabel]
 	klog.V(4).Infof("pod %s belongs to pod group: %s", pod.Name, pgName)
@@ -326,11 +325,12 @@ func (zr *ZoneResource) selectZone(pod *corev1.Pod) (string, error) {
 	// Check if the pod is member of a podgroup, if yes, get its members and check
 	// if the a zone was already attached to one of the pod.
 	var selectedZone string
-	pgInfo, err := zr.store.Get(pgName)
+	zoneData, err := zr.store.Get(pgName)
 	if err != nil {
-		klog.ErrorS(err, "Retrieve pod group from store", "pod", pod.Name, "podgroup", pgName)
+		klog.ErrorS(err, "Extracting zone data", "pod", pod.Name, "podgroup", pgName)
+	} else {
+		selectedZone = zoneData.Zone
 	}
-	selectedZone = pgInfo.Zone
 	klog.V(4).Infof("after group check for pod %s, selected zone is: %s", pod.Name, selectedZone)
 
 	// Zone already selected for the group, we can return early.
@@ -365,19 +365,27 @@ func (zr *ZoneResource) selectZone(pod *corev1.Pod) (string, error) {
 		orderedZones = zoneFreeAsc(zones)
 	}
 
+	klog.V(4).InfoS("Zones before intersection", "zones", orderedZones, "podgroup", pgName)
 	// Check if user provided zones, if so, filters the zone based on his selection.
 	userReqZones, ok := zr.userZoneAffinity(pod)
 	if ok {
 		orderedZones = intersection(orderedZones, userReqZones)
+		klog.V(4).InfoS("Zones before intersection", "zones", orderedZones, "podgroup", pgName)
 	}
 
 	for _, zone := range orderedZones {
+		klog.Infof("Checking zone %s: cards: %d", zone, zones[zone].freeCards)
 		if zones[zone].freeCards >= totalCards {
+			klog.V(4).InfoS("Found zone", "zone", zone)
 			return zone, nil
 		}
 	}
 
 	return "", fmt.Errorf("no zone can fulfill the request")
+}
+
+func isLauncher(pod *corev1.Pod) bool {
+	return pod.Labels[LabelMPIJobRole] == RoleLauncher
 }
 
 func (zr *ZoneResource) logPodGroup(pgName string) {
@@ -749,7 +757,7 @@ func (zr *ZoneResource) totalGroupRequest(podReq int, pgName string) (int64, err
 		return 0, err
 	}
 
-	excludeLauncher, err := labels.NewRequirement("training.kubeflow.org/job-role", selection.NotEquals, []string{"launcher"})
+	excludeLauncher, err := labels.NewRequirement(LabelMPIJobRole, selection.NotEquals, []string{RoleLauncher})
 	if err != nil {
 		return 0, err
 	}
@@ -771,53 +779,22 @@ type pgData struct {
 }
 
 func (pd *pgData) Clone() framework.StateData {
-	return pd
+	c := *pd
+	return &c
 }
 
-// alreadyScheduled returns a zone value if one of the members of a
-// pod group or an empty string if none.
-// func (zr *ZoneResource) alreadyScheduled(state *framework.CycleState, pgName string) (string, error) {
-// 	val, err := state.Read(framework.StateKey(pgName))
-// 	if err != nil {
-// 		if errors.Is(err, framework.ErrNotFound) {
-// 			klog.V(4).Info("key for zoneInfo not found")
-// 			return "", nil
-// 		}
-// 		return "", err
-// 	}
+func extractZoneData(state *framework.CycleState, pgName string) (*pgData, error) {
+	rawZoneData, err := state.Read(framework.StateKey(pgName))
+	if err != nil {
+		klog.ErrorS(err, "reading state for podgroup", "podgroup", pgName)
+		return nil, err
+	}
 
-// 	data, ok := val.(*pgData)
-// 	if !ok {
-// 		klog.V(4).ErrorS(errors.New("failed type converstion"), "alreadySchedued")
-// 		return "", err
-// 	}
-
-// 	if data.zone != "" {
-// 		klog.V(4).Infof("zone from cycle is not empty: %s", data.zone)
-// 		return data.zone, nil
-// 	}
-
-// 	pods, err := zr.frameworkHandler.SharedInformerFactory().Core().V1().Pods().Lister().List(
-// 		labels.SelectorFromSet(labels.Set{v1alpha1.PodGroupLabel: pgName}),
-// 	)
-// 	if err != nil {
-// 		return "", err
-// 	}
-
-// 	for _, pod := range pods {
-// 		if pod.Spec.NodeName != "" {
-// 			nodeInfo, err := zr.frameworkHandler.SnapshotSharedLister().NodeInfos().Get(pod.Spec.NodeName)
-// 			if err != nil {
-// 				return "", err
-// 			}
-// 			zone := nodeInfo.Node().Labels[zr.zoneLabel]
-// 			state.Write(framework.StateKey(pgName), &pgData{
-// 				zone: zone,
-// 			})
-// 			klog.V(4).Infof("Found one of the members already bounded to a zone: %s", zone)
-// 			return zone, nil
-// 		}
-// 	}
-
-// 	return "", nil
-// }
+	zoneData, ok := rawZoneData.(*pgData)
+	if !ok {
+		// Not expecting this case, but if happen retry the pod.
+		klog.Errorf("casting raw data to pgData. actual type: %T", rawZoneData)
+		return nil, framework.ErrNotFound
+	}
+	return zoneData, nil
+}
