@@ -314,7 +314,7 @@ func (zr *ZoneResource) selectZone(state *framework.CycleState, pod *corev1.Pod)
 	}
 	// TODO: consider flavors with lessthan 8, actually y do we care
 	reqResourceVal := reqHabanaResource(podHLResource, pod)
-	if reqResourceVal == 1 {
+	if reqResourceVal < 8 {
 		return "", ErrSkipZone
 	}
 	klog.V(4).Info("entered strict zone checking", "pod", pod.Name)
