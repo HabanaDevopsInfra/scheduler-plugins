@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/scheduler-plugins/pkg/coscheduling/core"
 	pgclientset "sigs.k8s.io/scheduler-plugins/pkg/generated/clientset/versioned"
 	pgformers "sigs.k8s.io/scheduler-plugins/pkg/generated/informers/externalversions"
+	"sigs.k8s.io/scheduler-plugins/pkg/resourcebasedzones"
 	"sigs.k8s.io/scheduler-plugins/pkg/util"
 )
 
@@ -244,6 +245,8 @@ func (cs *Coscheduling) Unreserve(ctx context.Context, state *framework.CycleSta
 		}
 	})
 	cs.pgMgr.DeletePermittedPodGroup(pgName)
+	klog.V(4).InfoS("Removing pod group from cache", "podgroup", pgName)
+	resourcebasedzones.Store.Delete(pgName)
 }
 
 // PostBind is called after a pod is successfully bound. These plugins are used update PodGroup when pod is bound.
