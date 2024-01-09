@@ -32,6 +32,9 @@ const (
 	RoleLauncher         = "launcher"
 )
 
+// Global caching store, as it needs to be shared with cocheculing plugin.
+var Store = store.NewInMemoryStore()
+
 // ZoneResource is a pluging that schedule pods in a zone based on resource
 type ZoneResource struct {
 	ResourceNamespace string
@@ -39,7 +42,7 @@ type ZoneResource struct {
 	cleanupInterval   int
 	frameworkHandler  framework.Handle
 	pgm               pgclientset.Interface
-	store             *store.InMemoryStore
+	// store             *store.InMemoryStore
 	// backoffQueue hold pods belonging to a pod group that we want to move
 	// to the back of the sorting queue, due to many failed attempts, and giving
 	// chance to others
@@ -49,10 +52,12 @@ type ZoneResource struct {
 	PriorityZones []string
 }
 
-var _ framework.PreFilterPlugin = &ZoneResource{}
-var _ framework.FilterPlugin = &ZoneResource{}
-var _ framework.ScorePlugin = &ZoneResource{}
-var _ framework.PostBindPlugin = &ZoneResource{}
+var (
+	_ framework.PreFilterPlugin = &ZoneResource{}
+	_ framework.FilterPlugin    = &ZoneResource{}
+	_ framework.ScorePlugin     = &ZoneResource{}
+	_ framework.PostBindPlugin  = &ZoneResource{}
+)
 
 func New(obj runtime.Object, handle framework.Handle) (framework.Plugin, error) {
 	args, ok := obj.(*config.ZoneResourceArgs)
@@ -73,8 +78,8 @@ func New(obj runtime.Object, handle framework.Handle) (framework.Plugin, error) 
 		ResourceNamespace: args.ResourceNamespace,
 		zoneLabel:         args.ZoneLabel,
 		PriorityZones:     args.PriorityZones,
-		store:             store.NewInMemoryStore(),
-		backoffQueue:      gochache.New(3*time.Second, 15*time.Second),
+		// store:             store.NewInMemoryStore(),
+		backoffQueue: gochache.New(3*time.Second, 15*time.Second),
 	}, nil
 }
 
@@ -188,7 +193,6 @@ func (zr *ZoneResource) scoreForQueue(podInfo *framework.QueuedPodInfo) int {
 // PreFilter cleans the in-memory cache for a pod group that was added more than 5 minutes ago
 // and still was not scheduled
 func (zr *ZoneResource) PreFilter(ctx context.Context, state *framework.CycleState, pod *corev1.Pod) *framework.Status {
-
 	// If pod is not habana resource or launcher, skip
 	if _, ok := pod.Labels["habana.ai/user"]; !ok || isLauncher(pod) {
 		klog.V(4).Info("non habana workload or mpi-launcher, skipping")
@@ -222,19 +226,17 @@ func (zr *ZoneResource) PreFilter(ctx context.Context, state *framework.CycleSta
 	})
 
 	// Cache for the lifetype of pods, and not just for scheduling context.
-	zr.store.Add(pgName, selectedZone, time.Now())
+	Store.Add(pgName, selectedZone, time.Now())
 
 	klog.Infof("selected zone for pod group %s: %s", pgName, selectedZone)
 	return framework.NewStatus(framework.Success, "")
 }
 
-var (
-	timeNow = time.Now
-)
+var timeNow = time.Now
 
 // shouldClean returns true if pod group exists in cache more then allowed.
 func (zr *ZoneResource) shouldClean(pgName string) bool {
-	pgInfo, err := zr.store.Get(pgName)
+	pgInfo, err := Store.Get(pgName)
 	if err != nil {
 		klog.V(5).Infof("shouldclean: pg not found in store: %s", pgName)
 		return false
@@ -312,9 +314,9 @@ func (zr *ZoneResource) selectZone(state *framework.CycleState, pod *corev1.Pod)
 	}
 	// TODO: consider flavors with lessthan 8, actually y do we care
 	reqResourceVal := reqHabanaResource(podHLResource, pod)
-	// if reqResourceVal == 1 {
-	// 	return "", ErrSkipZone
-	// }
+	if reqResourceVal < 8 {
+		return "", ErrSkipZone
+	}
 	klog.V(4).Info("entered strict zone checking", "pod", pod.Name)
 
 	pgName := pod.Labels[v1alpha1.PodGroupLabel]
@@ -325,7 +327,7 @@ func (zr *ZoneResource) selectZone(state *framework.CycleState, pod *corev1.Pod)
 	// Check if the pod is member of a podgroup, if yes, get its members and check
 	// if the a zone was already attached to one of the pod.
 	var selectedZone string
-	zoneData, err := zr.store.Get(pgName)
+	zoneData, err := Store.Get(pgName)
 	if err != nil {
 		klog.ErrorS(err, "Extracting zone data", "pod", pod.Name, "podgroup", pgName)
 	} else {
@@ -346,7 +348,7 @@ func (zr *ZoneResource) selectZone(state *framework.CycleState, pod *corev1.Pod)
 
 	// Log for verbosity
 	for name, info := range zones {
-		klog.V(4).Infof("Zone '%s' has %d free cards, possible preemption %d", name, info.freeCards, info.ToPreempt)
+		klog.V(4).InfoS("Zone cards information", "zone", name, "free_cards", info.freeCards, "cards_preempt", info.ToPreempt, "podgroup", pgName)
 	}
 
 	// Get total requested cards of the pod's group.
@@ -403,7 +405,6 @@ func (zr *ZoneResource) logPodGroup(pgName string) {
 }
 
 func (zr *ZoneResource) Score(ctx context.Context, state *framework.CycleState, p *corev1.Pod, nodeName string) (int64, *framework.Status) {
-
 	// If pod is not habana resource, skip
 	if _, ok := p.Labels["habana.ai/user"]; !ok {
 		return 0, nil
@@ -428,7 +429,6 @@ func (zr *ZoneResource) Score(ctx context.Context, state *framework.CycleState, 
 	// If we have a podGroup name for the pod, and we found a selected zone,
 	// we score only the nodes belonging to the zone.
 	if pgName != "" && zone != "" {
-
 		// If we have a selected zone, we want to give score only to nodes belonging to the zone,
 		// otherwise we'll give zero.
 		if nodeInfo.Node().Labels[zr.zoneLabel] == zone {
@@ -570,7 +570,7 @@ func (zr *ZoneResource) PostBind(ctx context.Context, _ *framework.CycleState, p
 	klog.V(5).Info("ZoneResource PostBind")
 	// If pod group is in scheduled mode, we can clean it from the memory store
 	pgName := pod.Labels[v1alpha1.PodGroupLabel]
-	zr.store.Delete(pgName)
+	Store.Delete(pgName)
 	klog.V(4).Infof("%s removed from store in PostBind", pgName)
 }
 
@@ -682,10 +682,6 @@ func (zr *ZoneResource) freeResource(node *framework.NodeInfo, priority int32, r
 	var potentialCards int64
 	var toPreempt int
 	for _, p := range habanaPods {
-		if _, ok := p.Pod.Labels["habana.ai/user"]; !ok {
-			continue
-		}
-
 		if priority > *p.Pod.Spec.Priority {
 			podCards := p.Pod.Spec.Containers[0].Resources.Limits[resourceName]
 			potentialCards += podCards.Value()
