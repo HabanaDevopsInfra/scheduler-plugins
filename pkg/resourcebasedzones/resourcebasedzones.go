@@ -42,7 +42,6 @@ type ZoneResource struct {
 	cleanupInterval   int
 	frameworkHandler  framework.Handle
 	pgm               pgclientset.Interface
-	// store             *store.InMemoryStore
 	// backoffQueue hold pods belonging to a pod group that we want to move
 	// to the back of the sorting queue, due to many failed attempts, and giving
 	// chance to others
@@ -593,6 +592,12 @@ func (zr *ZoneResource) zones(priority int32, resourceName corev1.ResourceName, 
 		// Filter masters, services, non ready nodes out
 		if isService(n.Node().Labels) || isMaster(n.Node().Labels) || !isReady(n.Node().Status.Conditions) {
 			klog.V(5).Infof("node %s is not a worker node", n.Node().Name)
+			continue
+		}
+
+		// Nodes that has this label, are not able to serve workloads with external ports up.
+		if _, ok := n.Node().Labels["habana.ai/no_external_network"]; ok {
+			klog.V(5).Infof("node %s does not support external network", n.Node().Name)
 			continue
 		}
 

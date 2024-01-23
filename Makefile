@@ -24,7 +24,7 @@ export DOCKER_BUILDKIT=1
 # registry, not production(k8s.gcr.io).
 RELEASE_REGISTRY?=artifactory-kfs.habana-labs.com/k8s-infra-docker-dev/github/scheduler-plugins
 # RELEASE_VERSION?=v$(shell date +%Y%m%d)-v0.23.10
-RELEASE_VERSION?=v0.23.37
+RELEASE_VERSION?=v0.23.38
 RELEASE_IMAGE:=kube-scheduler:$(RELEASE_VERSION)
 RELEASE_CONTROLLER_IMAGE:=controller:$(RELEASE_VERSION)
 
