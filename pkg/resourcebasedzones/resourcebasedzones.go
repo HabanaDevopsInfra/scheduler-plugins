@@ -199,7 +199,11 @@ func (zr *ZoneResource) PreFilter(ctx context.Context, state *framework.CycleSta
 	}
 
 	// Get Pod Group
-	pgName := pod.Labels[v1alpha1.PodGroupLabel]
+	pgName, ok := pod.Labels[v1alpha1.PodGroupLabel]
+	if !ok {
+		// Pod does not belog to a pod group so we'll skip.
+		return framework.NewStatus(framework.Success)
+	}
 
 	// SelectZone for pod
 	selectedZone, err := zr.selectZone(state, pod)
