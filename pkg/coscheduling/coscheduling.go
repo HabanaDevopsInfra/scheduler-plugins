@@ -46,11 +46,13 @@ type Coscheduling struct {
 	pgBackoff        *time.Duration
 }
 
-var _ framework.QueueSortPlugin = &Coscheduling{}
-var _ framework.PreFilterPlugin = &Coscheduling{}
-var _ framework.PostFilterPlugin = &Coscheduling{}
-var _ framework.PermitPlugin = &Coscheduling{}
-var _ framework.ReservePlugin = &Coscheduling{}
+var (
+	_ framework.QueueSortPlugin  = &Coscheduling{}
+	_ framework.PreFilterPlugin  = &Coscheduling{}
+	_ framework.PostFilterPlugin = &Coscheduling{}
+	_ framework.PermitPlugin     = &Coscheduling{}
+	_ framework.ReservePlugin    = &Coscheduling{}
+)
 
 var _ framework.EnqueueExtensions = &Coscheduling{}
 
@@ -118,11 +120,16 @@ func (cs *Coscheduling) Name() string {
 // 2. Compare the initialization timestamps of PodGroups or Pods.
 // 3. Compare the keys of PodGroups/Pods: <namespace>/<podname>.
 func (cs *Coscheduling) Less(podInfo1, podInfo2 *framework.QueuedPodInfo) bool {
+	// TODO: check if backoff is needed
+
 	prio1 := corev1helpers.PodPriority(podInfo1.Pod)
 	prio2 := corev1helpers.PodPriority(podInfo2.Pod)
 	if prio1 != prio2 {
 		return prio1 > prio2
 	}
+
+	// TODO: return pos with more members in group
+
 	creationTime1 := cs.pgMgr.GetCreationTimestamp(podInfo1.Pod, podInfo1.InitialAttemptTimestamp)
 	creationTime2 := cs.pgMgr.GetCreationTimestamp(podInfo2.Pod, podInfo2.InitialAttemptTimestamp)
 	if creationTime1.Equal(creationTime2) {
@@ -141,12 +148,22 @@ func (cs *Coscheduling) PreFilter(ctx context.Context, state *framework.CycleSta
 		klog.ErrorS(err, "PreFilter failed", "pod", klog.KObj(pod))
 		return nil, framework.NewStatus(framework.UnschedulableAndUnresolvable, err.Error())
 	}
+
+	// TODO: if pod is not 'habana.ai/user' or is launcher - skip
+	//
+	// TODO: select zone for pod
+	// if error is skip - skip
+
+	// TODO: save selected zone in state and in generic cache
 	return nil, framework.NewStatus(framework.Success, "")
 }
 
+// TODO: Add filter endpoint from our plugin
+
 // PostFilter is used to reject a group of pods if a pod does not pass PreFilter or Filter.
 func (cs *Coscheduling) PostFilter(ctx context.Context, state *framework.CycleState, pod *v1.Pod,
-	filteredNodeStatusMap framework.NodeToStatusMap) (*framework.PostFilterResult, *framework.Status) {
+	filteredNodeStatusMap framework.NodeToStatusMap,
+) (*framework.PostFilterResult, *framework.Status) {
 	pgName, pg := cs.pgMgr.GetPodGroup(pod)
 	if pg == nil {
 		klog.V(4).InfoS("Pod does not belong to any group", "pod", klog.KObj(pod))
@@ -196,6 +213,8 @@ func (cs *Coscheduling) PostFilter(ctx context.Context, state *framework.CycleSt
 func (cs *Coscheduling) PreFilterExtensions() framework.PreFilterExtensions {
 	return nil
 }
+
+// TODO: add score endpoint from our plugin
 
 // Permit is the functions invoked by the framework at "Permit" extension point.
 func (cs *Coscheduling) Permit(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodeName string) (*framework.Status, time.Duration) {
@@ -250,4 +269,5 @@ func (cs *Coscheduling) Unreserve(ctx context.Context, state *framework.CycleSta
 		}
 	})
 	cs.pgMgr.DeletePermittedPodGroup(pgName)
+	// TODO: remove from cache when fails - maybe not neccessary
 }
