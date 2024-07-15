@@ -18,12 +18,14 @@ package coscheduling
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
 	clientscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/cache"
 	corev1helpers "k8s.io/component-helpers/scheduling/corev1"
@@ -46,13 +48,15 @@ type Coscheduling struct {
 	pgBackoff        *time.Duration
 }
 
-var _ framework.QueueSortPlugin = &Coscheduling{}
-var _ framework.PreFilterPlugin = &Coscheduling{}
-var _ framework.PostFilterPlugin = &Coscheduling{}
-var _ framework.PermitPlugin = &Coscheduling{}
-var _ framework.ReservePlugin = &Coscheduling{}
-
-var _ framework.EnqueueExtensions = &Coscheduling{}
+var (
+	_ framework.QueueSortPlugin  = &Coscheduling{}
+	_ framework.PreFilterPlugin  = &Coscheduling{}
+	_ framework.PostFilterPlugin = &Coscheduling{}
+	// _ framework.FilterPlugin      = &Coscheduling{}
+	_ framework.PermitPlugin      = &Coscheduling{}
+	_ framework.ReservePlugin     = &Coscheduling{}
+	_ framework.EnqueueExtensions = &Coscheduling{}
+)
 
 const (
 	// Name is the name of the plugin used in Registry and configurations.
@@ -127,12 +131,29 @@ func (cs *Coscheduling) Less(podInfo1, podInfo2 *framework.QueuedPodInfo) bool {
 	if prio1 != prio2 {
 		return prio1 > prio2
 	}
+
+	// Prefer scheduling large groups.
+	mem1 := cs.minMembers(context.Background(), podInfo1.Pod)
+	mem2 := cs.minMembers(context.Background(), podInfo2.Pod)
+	if mem1 != mem2 {
+		return mem1 > mem2
+	}
+
 	creationTime1 := cs.pgMgr.GetCreationTimestamp(podInfo1.Pod, *podInfo1.InitialAttemptTimestamp)
 	creationTime2 := cs.pgMgr.GetCreationTimestamp(podInfo2.Pod, *podInfo2.InitialAttemptTimestamp)
 	if creationTime1.Equal(creationTime2) {
 		return core.GetNamespacedName(podInfo1.Pod) < core.GetNamespacedName(podInfo2.Pod)
 	}
 	return creationTime1.Before(creationTime2)
+}
+
+func (cs *Coscheduling) minMembers(ctx context.Context, pod *v1.Pod) int {
+	_, pg := cs.pgMgr.GetPodGroup(ctx, pod)
+	if pg == nil {
+		return 1
+	}
+
+	return int(pg.Spec.MinMember)
 }
 
 // PreFilter performs the following validations.
@@ -145,12 +166,44 @@ func (cs *Coscheduling) PreFilter(ctx context.Context, state *framework.CycleSta
 		klog.ErrorS(err, "PreFilter failed", "pod", klog.KObj(pod))
 		return nil, framework.NewStatus(framework.UnschedulableAndUnresolvable, err.Error())
 	}
+
+	// Restrict extension
+	if groupLabel, ok := pod.Annotations[v1alpha1.PodGroupAnnotationGroupBy]; ok {
+		pgName := util.GetPodGroupLabel(pod)
+		zone, err := cs.selectZone(ctx, state, pod, groupLabel)
+		if err != nil {
+			if errors.Is(err, ErrSkipZone) {
+				klog.V(4).InfoS("prefilter: skipping zone", "podgroup", pgName, "pod", pod.Name)
+				return nil, framework.NewStatus(framework.Success, "")
+			}
+			return nil, framework.NewStatus(framework.UnschedulableAndUnresolvable, err.Error())
+		}
+
+		nl, err := cs.frameworkHandler.SnapshotSharedLister().NodeInfos().List()
+		if err != nil {
+			return nil, framework.NewStatus(framework.Unschedulable, "prefilter: failed listing nodes")
+		}
+
+		// Filter all nodes based on selected zone
+		var nodesNames []string
+		for _, node := range nl {
+			if zone == node.Node().Labels[v1alpha1.PodGroupAnnotationGroupBy] {
+				nodesNames = append(nodesNames, node.Node().Name)
+			}
+		}
+
+		return &framework.PreFilterResult{
+			NodeNames: sets.New[string](nodesNames...),
+		}, framework.NewStatus(framework.Success, "")
+	}
+
 	return nil, framework.NewStatus(framework.Success, "")
 }
 
 // PostFilter is used to reject a group of pods if a pod does not pass PreFilter or Filter.
 func (cs *Coscheduling) PostFilter(ctx context.Context, state *framework.CycleState, pod *v1.Pod,
-	filteredNodeStatusMap framework.NodeToStatusMap) (*framework.PostFilterResult, *framework.Status) {
+	filteredNodeStatusMap framework.NodeToStatusMap,
+) (*framework.PostFilterResult, *framework.Status) {
 	pgName, pg := cs.pgMgr.GetPodGroup(ctx, pod)
 	if pg == nil {
 		klog.V(4).InfoS("Pod does not belong to any group", "pod", klog.KObj(pod))
