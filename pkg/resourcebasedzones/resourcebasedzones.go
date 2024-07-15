@@ -15,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/selection"
 	corev1helpers "k8s.io/component-helpers/scheduling/corev1"
+	"k8s.io/component-helpers/scheduling/corev1/nodeaffinity"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"sigs.k8s.io/scheduler-plugins/apis/config"
@@ -265,8 +266,9 @@ func (zr *ZoneResource) Filter(ctx context.Context, state *framework.CycleState,
 		return framework.NewStatus(framework.Success)
 	}
 
-	// If user provided his own node selector, it's his responsability
-	if zr.hasNodeSelectors(pod) {
+	// Compare user requested node affinity, and if node does not match,
+	// return early, as we don't take into account this node.
+	if !zr.matchAffinity(pod, nodeInfo.Node()) {
 		klog.V(4).InfoS("User provided specific selector", "pod", pod.Name)
 		return framework.NewStatus(framework.Success)
 	}
@@ -344,7 +346,7 @@ func (zr *ZoneResource) selectZone(state *framework.CycleState, pod *corev1.Pod)
 	}
 
 	// Get zones and their free cards
-	zones, err := zr.zones(*pod.Spec.Priority, podHLResource, reqResourceVal, pod.Labels["habana.ai/schedulable"], siteAffinity)
+	zones, err := zr.zones(pod, podHLResource, reqResourceVal, pod.Labels["habana.ai/schedulable"], siteAffinity)
 	if err != nil {
 		return "", fmt.Errorf("failed calculating zones: %s", err.Error())
 	}
@@ -450,25 +452,14 @@ func (zr *ZoneResource) Score(ctx context.Context, state *framework.CycleState, 
 	return nodeScore, nil
 }
 
-func (zr *ZoneResource) hasNodeSelectors(pod *corev1.Pod) bool {
-	if pod.Spec.Affinity != nil {
-		if pod.Spec.Affinity.NodeAffinity != nil {
-			required := pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
-			if required != nil {
-				for _, term := range required.NodeSelectorTerms {
-					for _, expr := range term.MatchExpressions {
-						// Skip when users requests for a specific hosts using = or 'in'. In cases he uses 'not in' or '!=' to exclude host(s) we continue.
-						if expr.Key == "kubernetes.io/hostname" && expr.Operator != corev1.NodeSelectorOpDoesNotExist && expr.Operator != corev1.NodeSelectorOpNotIn {
-							klog.V(5).InfoS("User selected specific hosts", "pod", pod.Name, "affinity", expr.String())
-							return true
-						}
-					}
-				}
-			}
-		}
+func (zr *ZoneResource) matchAffinity(pod *corev1.Pod, node *corev1.Node) bool {
+	reqRequired := nodeaffinity.GetRequiredNodeAffinity(pod)
+	match, err := reqRequired.Match(node)
+	if err != nil {
+		klog.V(4).ErrorS(err, "matching node by selectors")
+		return false
 	}
-
-	return false
+	return match
 }
 
 func (zr *ZoneResource) hasZoneAffinity(pod *corev1.Pod) bool {
@@ -583,7 +574,9 @@ type zoneInfo struct {
 	ToPreempt int
 }
 
-func (zr *ZoneResource) zones(priority int32, resourceName corev1.ResourceName, requiredCards int, schedulable, siteAffinity string) (map[string]zoneInfo, error) {
+func (zr *ZoneResource) zones(pod *corev1.Pod, resourceName corev1.ResourceName, requiredCards int, schedulable, siteAffinity string) (map[string]zoneInfo, error) {
+	priority := *pod.Spec.Priority
+
 	// zones is a map holding the zone (i.e a,b,c) and the number of the free cards
 	zones := make(map[string]zoneInfo)
 
@@ -600,21 +593,22 @@ func (zr *ZoneResource) zones(priority int32, resourceName corev1.ResourceName, 
 		}
 
 		// Nodes that has this label, are not able to serve workloads with external ports up.
-		if _, ok := n.Node().Labels["habana.ai/no_external_network"]; ok {
-			klog.V(5).Infof("node %s does not support external network", n.Node().Name)
-			continue
-		}
+		// if _, ok := n.Node().Labels["habana.ai/no_external_network"]; ok {
+		// 	klog.V(5).Infof("node %s does not support external network", n.Node().Name)
+		// 	continue
+		// }
 
 		// If user asked for a specifiec site, we'll skip nodes not in the site
-		if siteAffinity != "" && n.Node().Labels["habana.ai/site"] != siteAffinity {
+		if !zr.matchAffinity(pod, n.Node()) {
+			klog.V(5).Infof("node does not match user requested affinity", n.Node().Name)
 			continue
 		}
 
-		klog.V(4).Infof("Node %s schedulable: %s | Pod schedulable value: %s", n.Node().Name, n.Node().Labels["habana.ai/schedulable"], schedulable)
-		if n.Node().Labels["habana.ai/schedulable"] != schedulable {
-			klog.V(5).Infof("schedulable value: %s, but node %s schedulable value is %s", schedulable, n.Node().Name, n.Node().Labels["habana.ai/schedulable"])
-			continue
-		}
+		// klog.V(4).Infof("Node %s schedulable: %s | Pod schedulable value: %s", n.Node().Name, n.Node().Labels["habana.ai/schedulable"], schedulable)
+		// if n.Node().Labels["habana.ai/schedulable"] != schedulable {
+		// 	klog.V(5).Infof("schedulable value: %s, but node %s schedulable value is %s", schedulable, n.Node().Name, n.Node().Labels["habana.ai/schedulable"])
+		// 	continue
+		// }
 
 		nodeZone, ok := n.Node().Labels[zr.zoneLabel]
 		if !ok {
