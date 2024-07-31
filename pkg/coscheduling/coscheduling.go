@@ -167,37 +167,43 @@ func (cs *Coscheduling) PreFilter(ctx context.Context, state *framework.CycleSta
 		return nil, framework.NewStatus(framework.UnschedulableAndUnresolvable, err.Error())
 	}
 
-	// Restrict extension
-	if groupLabel, ok := pod.Annotations[v1alpha1.PodGroupAnnotationGroupBy]; ok {
-		pgName := util.GetPodGroupLabel(pod)
-		zone, err := cs.selectZone(ctx, state, pod, groupLabel)
-		if err != nil {
-			if errors.Is(err, ErrSkipZone) {
-				klog.V(4).InfoS("prefilter: skipping zone", "podgroup", pgName, "pod", pod.Name)
-				return nil, framework.NewStatus(framework.Success, "")
-			}
-			return nil, framework.NewStatus(framework.UnschedulableAndUnresolvable, err.Error())
-		}
-
-		nl, err := cs.frameworkHandler.SnapshotSharedLister().NodeInfos().List()
-		if err != nil {
-			return nil, framework.NewStatus(framework.Unschedulable, "prefilter: failed listing nodes")
-		}
-
-		// Filter all nodes based on selected zone
-		var nodesNames []string
-		for _, node := range nl {
-			if zone == node.Node().Labels[v1alpha1.PodGroupAnnotationGroupBy] {
-				nodesNames = append(nodesNames, node.Node().Name)
-			}
-		}
-
-		return &framework.PreFilterResult{
-			NodeNames: sets.New[string](nodesNames...),
-		}, framework.NewStatus(framework.Success, "")
+	if util.GetPodGroupLabel(pod) == "" {
+		return nil, framework.NewStatus(framework.Success, "")
 	}
 
-	return nil, framework.NewStatus(framework.Success, "")
+	// Restrict extension
+	groupLabelValue, ok := pod.Annotations[v1alpha1.PodGroupAnnotationGroupBy]
+	if !ok {
+		return nil, framework.NewStatus(framework.Success, "")
+	}
+	klog.V(4).InfoS("prefilter: pod requested zone restiction", "pod", pod.Name, "group_by", groupLabelValue)
+
+	pgName := util.GetPodGroupLabel(pod)
+	zone, err := cs.selectZone(ctx, state, pod)
+	if err != nil {
+		if errors.Is(err, ErrSkipZone) {
+			klog.V(4).InfoS("prefilter: skipping zone", "podgroup", pgName, "pod", pod.Name)
+			return nil, framework.NewStatus(framework.Success, "")
+		}
+		return nil, framework.NewStatus(framework.Unschedulable, err.Error())
+	}
+
+	nl, err := cs.frameworkHandler.SnapshotSharedLister().NodeInfos().List()
+	if err != nil {
+		return nil, framework.NewStatus(framework.Unschedulable, "prefilter: failed listing nodes")
+	}
+
+	// Filter all nodes based on selected zone
+	var nodesNames []string
+	for _, node := range nl {
+		if zone == node.Node().Labels[groupLabelValue] {
+			nodesNames = append(nodesNames, node.Node().Name)
+		}
+	}
+
+	return &framework.PreFilterResult{
+		NodeNames: sets.New(nodesNames...),
+	}, framework.NewStatus(framework.Success, "")
 }
 
 // PostFilter is used to reject a group of pods if a pod does not pass PreFilter or Filter.
@@ -228,12 +234,12 @@ func (cs *Coscheduling) PostFilter(ctx context.Context, state *framework.CycleSt
 
 	// It's based on an implicit assumption: if the nth Pod failed,
 	// it's inferrable other Pods belonging to the same PodGroup would be very likely to fail.
-	cs.frameworkHandler.IterateOverWaitingPods(func(waitingPod framework.WaitingPod) {
-		if waitingPod.GetPod().Namespace == pod.Namespace && util.GetPodGroupLabel(waitingPod.GetPod()) == pg.Name {
-			klog.V(3).InfoS("PostFilter rejects the pod", "podGroup", klog.KObj(pg), "pod", klog.KObj(waitingPod.GetPod()))
-			waitingPod.Reject(cs.Name(), "optimistic rejection in PostFilter")
-		}
-	})
+	// cs.frameworkHandler.IterateOverWaitingPods(func(waitingPod framework.WaitingPod) {
+	// 	if waitingPod.GetPod().Namespace == pod.Namespace && util.GetPodGroupLabel(waitingPod.GetPod()) == pg.Name {
+	// 		klog.V(3).InfoS("PostFilter rejects the pod", "podGroup", klog.KObj(pg), "pod", klog.KObj(waitingPod.GetPod()))
+	// 		waitingPod.Reject(cs.Name(), "optimistic rejection in PostFilter")
+	// 	}
+	// })
 
 	if cs.pgBackoff != nil {
 		pods, err := cs.frameworkHandler.SharedInformerFactory().Core().V1().Pods().Lister().Pods(pod.Namespace).List(
@@ -281,6 +287,8 @@ func (cs *Coscheduling) Permit(ctx context.Context, state *framework.CycleState,
 				waitingPod.Allow(cs.Name())
 			}
 		})
+		// TODO: better name
+		cs.pgMgr.DeleteZoneForPodGroup(pgFullName)
 		klog.V(3).InfoS("Permit allows", "pod", klog.KObj(pod))
 		retStatus = framework.NewStatus(framework.Success)
 		waitTime = 0
@@ -307,4 +315,5 @@ func (cs *Coscheduling) Unreserve(ctx context.Context, state *framework.CycleSta
 		}
 	})
 	cs.pgMgr.DeletePermittedPodGroup(pgName)
+	cs.pgMgr.DeleteZoneForPodGroup(pgName)
 }

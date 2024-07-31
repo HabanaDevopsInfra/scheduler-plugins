@@ -9,26 +9,18 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/selection"
+	"k8s.io/component-helpers/scheduling/corev1/nodeaffinity"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"sigs.k8s.io/scheduler-plugins/apis/scheduling/v1alpha1"
+	"sigs.k8s.io/scheduler-plugins/pkg/coscheduling/core"
 	"sigs.k8s.io/scheduler-plugins/pkg/util"
 )
 
 var ErrSkipZone = errors.New("skipping strict-zone selection")
 
-type podGroupZone struct {
-	zone string
-	skip bool
-}
-
-func (p *podGroupZone) Clone() framework.StateData {
-	c := *p
-	return &c
-}
-
-func (cs *Coscheduling) selectZone(ctx context.Context, state *framework.CycleState, pod *v1.Pod, groupLabel string) (string, error) {
-	resName, ok := pod.Annotations[v1alpha1.PodGroupAnnotationGroupResource]
+func (cs *Coscheduling) selectZone(ctx context.Context, _ *framework.CycleState, pod *v1.Pod) (string, error) {
+	resourceName, ok := pod.Annotations[v1alpha1.PodGroupAnnotationGroupResource]
 	if !ok {
 		// TODO: Fail or skip on grouping?
 		return "", fmt.Errorf("%w: pod requested grouping, but did not provide resource", ErrSkipZone)
@@ -38,16 +30,14 @@ func (cs *Coscheduling) selectZone(ctx context.Context, state *framework.CycleSt
 
 	// TODO: required resources
 
-	// Site affinity.. too specific to us?
-	//
-	var selectedZone string
-	// Get from cache by pgname
-
-	if selectedZone != "" {
-		return selectedZone, nil
+	// Check in cache if the group has already have a zone.
+	zoneData := cs.pgMgr.GetPodGroupZone(ctx, pgName)
+	if zoneData != nil {
+		klog.V(4).InfoS("zone found in cache", "podgroup", pgName, "zone", zoneData.Zone)
+		return zoneData.Zone, nil
 	}
 
-	zones, err := cs.zones(*pod.Spec.Priority, resName, resValue, pod.Annotations)
+	zones, err := cs.zones(pod, resourceName)
 	if err != nil {
 		return "", nil
 	}
@@ -70,7 +60,7 @@ func (cs *Coscheduling) selectZone(ctx context.Context, state *framework.CycleSt
 	if err != nil {
 		return "", err
 	}
-	klog.V(4).Infof("Total requested resources for %s: %d", pgName, totalResources)
+	klog.V(4).InfoS("Total requested resources", "podgroup", pgName, "resource", resourceName, "total_requested", totalResources)
 
 	// Order the zones by least destructive behavior for the pod's case.
 	var orderedZones []string
@@ -81,15 +71,22 @@ func (cs *Coscheduling) selectZone(ctx context.Context, state *framework.CycleSt
 	}
 
 	// Check if user provided specific zones, then filter the list by his choice.
-	userReqZone, ok := cs.userZoneAffinity(pod)
-	if ok {
-		orderedZones = intersection(orderedZones, userReqZone)
-	}
+	// userReqZone, ok := cs.userZoneAffinity(pod)
+	// if ok {
+	// 	orderedZones = intersection(orderedZones, userReqZone)
+	// }
 
 	for _, zone := range orderedZones {
-		klog.Infof("Checking zone for free sources", "zone", zone, "free_resources", zones[zone].freeResources)
+		klog.InfoS("Checking zone for free sources", "zone", zone, "free_resources", zones[zone].freeResources)
 		if zones[zone].freeResources >= totalResources {
 			klog.InfoS("Found zone", "podgroup", pgName, "zone", zone)
+			if err := cs.pgMgr.AddPodGroupZone(ctx, pgName, &core.PodGroupZone{
+				Zone: zone,
+			}); err != nil {
+				klog.ErrorS(err, "Adding podgroup to cache", "podgroup", pgName, "pod", pod.Name)
+				return "", fmt.Errorf("failed adding podgroup to cache: %w", err)
+			}
+
 			return zone, nil
 		}
 	}
@@ -102,11 +99,13 @@ type zoneInfo struct {
 	toPreempt     int64
 }
 
-func (cs *Coscheduling) zones(priority int32, resName string, resVal int64, requiredResources int, annotations map[string]string) (map[string]zoneInfo, error) {
+func (cs *Coscheduling) zones(pod *v1.Pod, resName string) (map[string]zoneInfo, error) {
+	priority := *pod.Spec.Priority
+
 	zones := make(map[string]zoneInfo)
 
-	groupBy := annotations[v1alpha1.PodGroupAnnotationGroupBy]
-	excludeSelector := annotations[v1alpha1.PodGroupAnnotationExclude]
+	groupBy := pod.Annotations[v1alpha1.PodGroupAnnotationGroupBy]
+	excludeSelector := pod.Annotations[v1alpha1.PodGroupAnnotationExclude]
 
 	nl, err := cs.frameworkHandler.SnapshotSharedLister().NodeInfos().List()
 	if err != nil {
@@ -118,10 +117,12 @@ func (cs *Coscheduling) zones(priority int32, resName string, resVal int64, requ
 		return nil, fmt.Errorf("invalid exclude annotations: %w", err)
 	}
 
+	podRequestedResource := extractPodResource(pod, resName)
+
 	for _, n := range nl {
 		// TODO: filter by exlude label
-		if isExcluded(n, reqs) || !isReady(n) {
-			klog.V(5).InfoS("node excluded", "node", n.Node().Name, "reason", "not ready or excluded by selector")
+		if !matchAffinity(pod, n.Node()) || isExcluded(n, reqs) || !isReady(n) {
+			klog.V(5).InfoS("node excluded", "podgroup", util.GetPodGroupLabel(pod), "node", n.Node().Name, "reason", "not ready or excluded by selector")
 			continue
 		}
 
@@ -137,8 +138,9 @@ func (cs *Coscheduling) zones(priority int32, resName string, resVal int64, requ
 		// Multi-HLS requested are expected to be with full-boxes, so we add only nodes
 		// that can potentially hold 8-cards pods.
 		// TODO: compare to pod request, than calculate if there are enough nodes for min member
-		if resFree < int64(requiredResources) {
-			klog.V(4).Infof("node %s [%d] cannot serve pod for %d cards", n.Node().Name, resFree, requiredResources)
+		if resFree < int64(podRequestedResource) {
+			klog.V(4).InfoS("node exluded", "node", n.Node().Name,
+				"reason", fmt.Sprintf("not enough resources: requested: %d, free %d", podRequestedResource, resFree))
 			continue
 		}
 
@@ -204,7 +206,7 @@ func (cs *Coscheduling) totalGroupRequest(ctx context.Context, pod *v1.Pod) (int
 	}
 
 	// Check if podgroup has the minResource configured in spec
-	pgName, pg := cs.pgMgr.GetPodGroup(ctx, pod)
+	_, pg := cs.pgMgr.GetPodGroup(ctx, pod)
 	if pg == nil {
 		return 0, fmt.Errorf("pod group not found in manager")
 	}
@@ -219,18 +221,12 @@ func (cs *Coscheduling) totalGroupRequest(ctx context.Context, pod *v1.Pod) (int
 	}
 
 	// Extract the requested resource value from the containers
-	var resValue int64
-	for _, c := range pod.Spec.Containers {
-		if val, ok := c.Resources.Requests[v1.ResourceName(resName)]; ok {
-			resValue = val.Value()
-			break
-		}
-	}
+	resValue := extractPodResource(pod, resName)
 
 	// Find all members of the group
-	pgReq, err := labels.NewRequirement(v1alpha1.PodGroupLabel, selection.Equals, []string{pgName})
+	pgReq, err := labels.NewRequirement(v1alpha1.PodGroupLabel, selection.Equals, []string{pg.Name})
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("finding all members of podgroup: %w", err)
 	}
 	selector := labels.NewSelector().Add(*pgReq)
 	pods, err := cs.frameworkHandler.SharedInformerFactory().Core().V1().Pods().Lister().List(selector)
@@ -250,12 +246,14 @@ func (cs *Coscheduling) freeResources(node *framework.NodeInfo, priority int32, 
 	var podsOnNode []*framework.PodInfo
 	for _, p := range node.Pods {
 		if hasRequestedResource(p, resName) {
+			klog.V(5).Infof("resources: counting pod: %s", p.Pod.Name)
 			podsOnNode = append(podsOnNode, p)
 		}
 	}
 
 	inUse := node.Requested.ScalarResources[resName]
-	if priority == 0 {
+	klog.V(5).InfoS("calculated resources on node", "node", node.Node().Name, "allocatable", allocatable, "in_use", inUse)
+	if priority == 0 || len(podsOnNode) == 0 {
 		return allocatable - inUse, 0
 	}
 
@@ -279,4 +277,23 @@ func hasRequestedResource(pod *framework.PodInfo, resName v1.ResourceName) bool 
 		}
 	}
 	return false
+}
+
+func extractPodResource(pod *v1.Pod, resourceName string) int64 {
+	for _, c := range pod.Spec.Containers {
+		if val, ok := c.Resources.Requests[v1.ResourceName(resourceName)]; ok {
+			return val.Value()
+		}
+	}
+	return 0
+}
+
+func matchAffinity(pod *v1.Pod, node *v1.Node) bool {
+	reqRequired := nodeaffinity.GetRequiredNodeAffinity(pod)
+	match, err := reqRequired.Match(node)
+	if err != nil {
+		klog.V(4).ErrorS(err, "matching node by selectors")
+		return false
+	}
+	return match
 }

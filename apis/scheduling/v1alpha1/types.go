@@ -109,7 +109,7 @@ const (
 	PodGroupLabel = scheduling.GroupName + "/pod-group"
 
 	// PodGroupGroupBy is an annotation that allows grouping of nodes per label for the purpose
-	// of resource calculation per group.
+	// of resource calculation per group. i.e example.com/zone
 	PodGroupAnnotationGroupBy = scheduling.GroupName + "/group-by"
 
 	// PodGroupAnnotationGroupResource is the annotation of the resource name to calculate its
