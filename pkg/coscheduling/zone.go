@@ -220,9 +220,6 @@ func (cs *Coscheduling) totalGroupRequest(ctx context.Context, pod *v1.Pod) (int
 		}
 	}
 
-	// Extract the requested resource value from the containers
-	resValue := extractPodResource(pod, resName)
-
 	// Find all members of the group
 	pgReq, err := labels.NewRequirement(v1alpha1.PodGroupLabel, selection.Equals, []string{pg.Name})
 	if err != nil {
@@ -233,10 +230,13 @@ func (cs *Coscheduling) totalGroupRequest(ctx context.Context, pod *v1.Pod) (int
 	if err != nil {
 		return 0, err
 	}
-	// TODO: Filter out pods without the req annotation, as it is expected only
-	// on pods that actually
 
-	return int64(len(pods)) * resValue, nil
+	var totalRes int64
+	for _, p := range pods {
+		totalRes += extractPodResource(p, resName)
+	}
+
+	return totalRes, nil
 }
 
 func (cs *Coscheduling) freeResources(node *framework.NodeInfo, priority int32, resName v1.ResourceName) (int64, int) {
@@ -245,7 +245,7 @@ func (cs *Coscheduling) freeResources(node *framework.NodeInfo, priority int32, 
 	// TODO: do we care about specific pods or just those who has the resources?
 	var podsOnNode []*framework.PodInfo
 	for _, p := range node.Pods {
-		if hasRequestedResource(p, resName) {
+		if hasRequestedResource(p.Pod, resName) {
 			klog.V(5).Infof("resources: counting pod: %s", p.Pod.Name)
 			podsOnNode = append(podsOnNode, p)
 		}
@@ -270,8 +270,8 @@ func (cs *Coscheduling) freeResources(node *framework.NodeInfo, priority int32, 
 	return (allocatable - inUse) + potentialCards, toPreempt
 }
 
-func hasRequestedResource(pod *framework.PodInfo, resName v1.ResourceName) bool {
-	for _, c := range pod.Pod.Spec.Containers {
+func hasRequestedResource(pod *v1.Pod, resName v1.ResourceName) bool {
+	for _, c := range pod.Spec.Containers {
 		if _, ok := c.Resources.Requests[resName]; ok {
 			return true
 		}
