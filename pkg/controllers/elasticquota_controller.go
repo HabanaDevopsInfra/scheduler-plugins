@@ -101,7 +101,7 @@ func (r *ElasticQuotaReconciler) computeElasticQuotaUsed(ctx context.Context, na
 	}
 
 	for _, p := range podList.Items {
-		if p.Status.Phase == v1.PodRunning {
+		if (p.Spec.NodeName != "" || p.Status.NominatedNodeName != "") || p.Status.Phase == v1.PodRunning {
 			used = quota.Add(used, computePodResourceRequest(&p))
 		}
 	}

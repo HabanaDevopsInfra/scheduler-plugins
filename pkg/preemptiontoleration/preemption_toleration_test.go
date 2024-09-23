@@ -32,9 +32,7 @@ import (
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 )
 
-var (
-	testPriorityClassName = "dummy"
-)
+var testPriorityClassName = "dummy"
 
 type testCase struct {
 	name                         string
@@ -218,6 +216,8 @@ func (tt testCase) run(t *testing.T) {
 	informersFactory := informers.NewSharedInformerFactory(fakeClient, 1*time.Minute)
 	pcInformer := informersFactory.Scheduling().V1().PriorityClasses().Informer()
 	informersFactory.Start(context.Background().Done())
+	pgLister := schedSharedFactory.Scheduling().V1alpha1().PodGroups().Lister()
+	eqLister := schedSharedFactory.Scheduling().V1alpha1().ElasticQuotas().Lister()
 	cache.WaitForCacheSync(context.Background().Done(), pcInformer.HasSynced)
 
 	now := tt.now

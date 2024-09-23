@@ -25,6 +25,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	policy "k8s.io/api/policy/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -36,7 +37,6 @@ import (
 	corev1helpers "k8s.io/component-helpers/scheduling/corev1"
 	"k8s.io/klog/v2"
 	extenderv1 "k8s.io/kube-scheduler/extender/v1"
-	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	schedulerapisconfig "k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config/validation"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
@@ -45,6 +45,10 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/util"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/scheduler-plugins/apis/config"
+	"sigs.k8s.io/scheduler-plugins/pkg/generated/clientset/versioned"
+	"sigs.k8s.io/scheduler-plugins/pkg/generated/informers/externalversions"
+	"sigs.k8s.io/scheduler-plugins/pkg/generated/listers/scheduling/v1alpha1"
+	schedutil "sigs.k8s.io/scheduler-plugins/pkg/util"
 )
 
 const (
@@ -63,6 +67,8 @@ type PreemptionToleration struct {
 	args                config.PreemptionTolerationArgs
 	podLister           corelisters.PodLister
 	pdbLister           policylisters.PodDisruptionBudgetLister
+	pgLister            v1alpha1.PodGroupLister
+	eqLister            v1alpha1.ElasticQuotaLister
 	priorityClassLister schedulinglisters.PriorityClassLister
 
 	clock   clock.Clock
@@ -85,12 +91,21 @@ func New(rawArgs runtime.Object, fh framework.Handle) (framework.Plugin, error) 
 		return nil, err
 	}
 
+	client, err := versioned.NewForConfig(fh.KubeConfig())
+	if err != nil {
+		return nil, err
+	}
+
+	schedSharedFactory := externalversions.NewSharedInformerFactory(client, 5*time.Minute)
+
 	pl := PreemptionToleration{
 		fh:                  fh,
 		args:                *args,
 		podLister:           fh.SharedInformerFactory().Core().V1().Pods().Lister(),
 		priorityClassLister: fh.SharedInformerFactory().Scheduling().V1().PriorityClasses().Lister(),
 		pdbLister:           getPDBLister(fh.SharedInformerFactory()),
+		pgLister:            schedSharedFactory.Scheduling().V1alpha1().PodGroups().Lister(),
+		eqLister:            schedSharedFactory.Scheduling().V1alpha1().ElasticQuotas().Lister(),
 		clock:               clock.RealClock{},
 	}
 	return &pl, nil
@@ -123,12 +138,54 @@ func (pl *PreemptionToleration) PostFilter(ctx context.Context, state *framework
 func ExemptedFromPreemption(
 	victimCandidate, preemptor *v1.Pod,
 	pcLister schedulinglisters.PriorityClassLister,
+	pgLister v1alpha1.PodGroupLister,
+	eqLister v1alpha1.ElasticQuotaLister,
 	now time.Time,
 ) (bool, error) {
-	if victimCandidate.Spec.PriorityClassName == "" {
-		return false, nil
+	// ########## Deny preemptions from other namespaces when max is full #############
+
+	eqs, err := eqLister.ElasticQuotas(preemptor.Namespace).List(labels.NewSelector())
+	if err != nil {
+		return false, err
 	}
-	victimPriorityClass, err := pcLister.Get(victimCandidate.Spec.PriorityClassName)
+
+	if len(eqs) == 1 {
+		klog.V(5).InfoS("ElasticQuota found", "namespace", preemptor.Namespace)
+		eq := eqs[0]
+
+		// Chech each configured 'max' value in an ElasticQuota to avoid checking resources that are shown
+		// in used and does not have configured max.
+		//
+		// This requires change if the way we use EQ changes.
+		preemptorResources := schedutil.GetPodEffectiveRequest(preemptor)
+		pgMembers := getPodGroupMembers(pgLister, preemptor)
+		for resName, maxVal := range eq.Spec.Max {
+			usedVal := eq.Status.Used[resName]
+			preemptorReq := preemptorResources[resName]
+			preemptorPGReq := preemptorReq.Value() * pgMembers
+
+			// If we maxed out the usage of the ElasticQuota already, or the preemptor's pod group total request plus the used value will be over the max,
+			// we want to avoid preempting resources from other namespaces. So if the victim doesn't belong to the preemptor namespace,
+			// we exempt it.
+			//
+			// We look at the pod group's total to make sure one pod out of many does not cause preemption, even tough the pod group
+			// will be blocked by the EQ plugin later.
+			if preemptorPGReq+usedVal.Value() > maxVal.Value() && preemptor.Namespace != victimCandidate.Namespace {
+				klog.V(5).InfoS(
+					"Victim exempted",
+					"victim", victimCandidate.Name,
+					"victim_namespace", victimCandidate.Namespace,
+					"preemptor", preemptor.Name,
+					"preemptor_namespace", preemptor.Namespace,
+					"reason", "Used more than max in EQ",
+				)
+				return true, nil
+			}
+		}
+	}
+	// ########## END #############
+
+	preemptorPriorityClass, err := pcLister.Get(preemptor.Spec.PriorityClassName)
 	if err != nil {
 		return false, err
 	}
@@ -137,12 +194,25 @@ func ExemptedFromPreemption(
 	if preemptor.Spec.PreemptionPolicy != nil {
 		preemptorPreemptionPolicy = *preemptor.Spec.PreemptionPolicy
 	}
+
 	if preemptorPreemptionPolicy == v1.PreemptNever {
+		klog.V(5).InfoS("Victim exempted", "reason", "Preemptor policy set to Never")
 		return true, nil
 	}
 
-	// check it can tolerate the preemption in terms of priority value
-	policy, err := parsePreemptionTolerationPolicy(*victimPriorityClass)
+	if victimCandidate.Spec.PriorityClassName == "" {
+		return false, nil
+	}
+
+	// Since we handled victims with no priority classes above, it is now safe to collect data.
+	victimPriorityClass, err := pcLister.Get(victimCandidate.Spec.PriorityClassName)
+	if err != nil {
+		if !errors.IsNotFound(err) {
+			return false, err
+		}
+	}
+
+	victimPolicy, err := parsePreemptionTolerationPolicy(*victimPriorityClass)
 	if err != nil {
 		// if any error raised, no toleration at all
 		klog.ErrorS(err, "Failed to parse preemption toleration policy of victim candidate's priorityclass.  This victim candidate can't tolerate the preemption",
@@ -152,24 +222,71 @@ func ExemptedFromPreemption(
 		)
 		return false, nil
 	}
-	preemptorPriority := corev1helpers.PodPriority(preemptor)
-	if preemptorPriority >= policy.MinimumPreemptablePriority {
-		return false, nil
-	}
 
-	if policy.TolerationSeconds < 0 {
+	if preemptorPriorityClass.Value <= victimPolicy.MinimumPreemptablePriority {
+		klog.V(5).InfoS(
+			"Victim exempted",
+			"reason", "Preemptor priority value is less-equal to the minimum priority configured",
+			"preemptor", preemptor.Name,
+			"victim", victimCandidate.Name,
+		)
 		return true, nil
 	}
 
-	// check it can tolerate the preemption in terms of toleration seconds
-	_, scheduledCondition := podutil.GetPodCondition(&victimCandidate.Status, v1.PodScheduled)
-	if scheduledCondition == nil || scheduledCondition.Status != v1.ConditionTrue {
-		return true, nil
-	}
-	scheduledAt := scheduledCondition.LastTransitionTime.Time
-	tolerationDuration := time.Duration(policy.TolerationSeconds) * time.Second
+	klog.V(5).InfoS(
+		"Victim not exempted",
+		"reason", "Victim did not match any of the filters",
+		"preemptor", preemptor.Name,
+		"victim", victimCandidate.Name,
+	)
 
-	return scheduledAt.Add(tolerationDuration).After(now), nil
+	return false, nil
+
+	// NOTE:
+	// We ignore a feature of using the mimimum seconds since it does not fit the required
+	// behavior we want in the cluster.
+
+	// check it can tolerate the preemption in terms of priority value
+	// policy, err := parsePreemptionTolerationPolicy(*victimPriorityClass)
+	// if err != nil {
+	// 	// if any error raised, no toleration at all
+	// 	klog.ErrorS(err, "Failed to parse preemption toleration policy of victim candidate's priorityclass.  This victim candidate can't tolerate the preemption",
+	// 		"PreemptorPod", klog.KObj(preemptor),
+	// 		"VictimCandidatePod", klog.KObj(victimCandidate),
+	// 		"VictimCandidatePriorityClass", klog.KRef("", victimPriorityClass.Name),
+	// 	)
+	// 	return false, nil
+	// }
+	// preemptorPriority := corev1helpers.PodPriority(preemptor)
+	// if preemptorPriority >= policy.MinimumPreemptablePriority {
+	// 	return false, nil
+	// }
+
+	// if policy.TolerationSeconds < 0 {
+	// 	return true, nil
+	// }
+	//
+	// // check it can tolerate the preemption in terms of toleration seconds
+	// _, scheduledCondition := podutil.GetPodCondition(&victimCandidate.Status, v1.PodScheduled)
+	// if scheduledCondition == nil || scheduledCondition.Status != v1.ConditionTrue {
+	// 	return true, nil
+	// }
+	// scheduledAt := scheduledCondition.LastTransitionTime.Time
+	// tolerationDuration := time.Duration(policy.TolerationSeconds) * time.Second
+	//
+	// return scheduledAt.Add(tolerationDuration).After(now), nil
+}
+
+func getPodGroupMembers(pgLister v1alpha1.PodGroupLister, pod *v1.Pod) int64 {
+	pgName := schedutil.GetPodGroupLabel(pod)
+	if len(pgName) == 0 {
+		return 1
+	}
+	pg, err := pgLister.PodGroups(pod.Namespace).Get(pgName)
+	if err != nil {
+		return 1
+	}
+	return int64(pg.Spec.MinMember)
 }
 
 // SelectVictimsOnNode finds minimum set of pods on the given node that should
@@ -182,7 +299,8 @@ func (pl *PreemptionToleration) SelectVictimsOnNode(
 	state *framework.CycleState,
 	preemptor *v1.Pod,
 	nodeInfo *framework.NodeInfo,
-	pdbs []*policy.PodDisruptionBudget) ([]*v1.Pod, int, *framework.Status) {
+	pdbs []*policy.PodDisruptionBudget,
+) ([]*v1.Pod, int, *framework.Status) {
 	var potentialVictims []*framework.PodInfo
 	removePod := func(rpi *framework.PodInfo) error {
 		if err := nodeInfo.RemovePod(rpi.Pod); err != nil {
@@ -212,7 +330,7 @@ func (pl *PreemptionToleration) SelectVictimsOnNode(
 		}
 
 		// For a pod with lower priority, check if it can be exempted from the preemption.
-		exempted, err := ExemptedFromPreemption(pi.Pod, preemptor, pl.priorityClassLister, pl.curTime)
+		exempted, err := ExemptedFromPreemption(pi.Pod, preemptor, pl.priorityClassLister, pl.pgLister, pl.eqLister, pl.curTime)
 		if err != nil {
 			klog.ErrorS(err, "Encountered error while selecting victims on node", "Node", nodeInfo.Node().Name)
 			return nil, 0, framework.AsStatus(err)
