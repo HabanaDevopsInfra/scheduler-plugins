@@ -193,29 +193,11 @@ func cmp(x, y *framework.Resource, bound int64) bool {
 	return cmp2(x, &framework.Resource{}, y, bound)
 }
 
-func cmp2(x1, x2, y *framework.Resource, bound int64) bool {
-	if x1.MilliCPU+x2.MilliCPU > y.MilliCPU {
-		return true
-	}
-
-	if x1.Memory+x2.Memory > y.Memory {
-		return true
-	}
-
-	if x1.EphemeralStorage+x2.EphemeralStorage > y.EphemeralStorage {
-		return true
-	}
-
-	if x1.AllowedPodNumber+x2.AllowedPodNumber > y.AllowedPodNumber {
-		return true
-	}
-
-	for rName, rQuant := range x1.ScalarResources {
-		yQuant := bound
-		if yq, ok := y.ScalarResources[rName]; ok {
-			yQuant = yq
-		}
-		if rQuant+x2.ScalarResources[rName] > yQuant {
+func cmp2(request *framework.Resource, used *framework.Resource, boundary *framework.Resource, bound int64) bool {
+	// Loop through all the resources of the boundary (min/max) and check if the request +
+	// used > boundary
+	for resourceName, boundaryResourceQuantity := range boundary.ScalarResources {
+		if used.ScalarResources[resourceName]+request.ScalarResources[resourceName] > boundaryResourceQuantity {
 			return true
 		}
 	}
