@@ -70,6 +70,9 @@ type Manager interface {
 	CalculateAssignedPods(string, string) int
 	ActivateSiblings(pod *corev1.Pod, state *framework.CycleState)
 	BackoffPodGroup(string, time.Duration)
+	AddPodGroupZone(ctx context.Context, pgName string, zoneData *PodGroupZone) error
+	GetPodGroupZone(ctx context.Context, pgName string) *PodGroupZone
+	DeleteZoneForPodGroup(pgFullName string)
 }
 
 // PodGroupManager defines the scheduling operation called
@@ -85,9 +88,21 @@ type PodGroupManager struct {
 	permittedPG *gocache.Cache
 	// backedOffPG stores the podgorup name which failed scheudling recently.
 	backedOffPG *gocache.Cache
+	// groupByPG stores the podgorup zone assosication
+	groupByPG *gocache.Cache
 	// podLister is pod lister
 	podLister listerv1.PodLister
 	sync.RWMutex
+}
+
+type PodGroupZone struct {
+	Zone string
+	Skip bool
+}
+
+func (z *PodGroupZone) Clone() framework.StateData {
+	c := *z
+	return &c
 }
 
 // NewPodGroupManager creates a new operation object.
@@ -99,6 +114,7 @@ func NewPodGroupManager(client client.Client, snapshotSharedLister framework.Sha
 		podLister:            podInformer.Lister(),
 		permittedPG:          gocache.New(3*time.Second, 3*time.Second),
 		backedOffPG:          gocache.New(10*time.Second, 10*time.Second),
+		groupByPG:            gocache.New(*scheduleTimeout, gochache.NoExpiration),
 	}
 	return pgMgr
 }
@@ -291,6 +307,28 @@ func (pgMgr *PodGroupManager) CalculateAssignedPods(podGroupName, namespace stri
 	}
 
 	return count
+}
+
+func (pgMgr *PodGroupManager) AddPodGroupZone(_ context.Context, pgName string, zoneData *PodGroupZone) error {
+	return pgMgr.groupByPG.Add(pgName, zoneData, *pgMgr.scheduleTimeout)
+}
+
+// GetPodGroupZone looks in the cache for a selected zone for a pod group. returns nil if none.
+func (pgMgr *PodGroupManager) GetPodGroupZone(_ context.Context, pgName string) *PodGroupZone {
+	d, found := pgMgr.groupByPG.Get(pgName)
+	if !found {
+		return nil
+	}
+	zoneData, ok := d.(*PodGroupZone)
+	if !ok {
+		return nil
+	}
+	return zoneData
+}
+
+// DeleteZoneForPodGroup deletes a podGroup that passes Pre-Filter but reaches PostFilter.
+func (pgMgr *PodGroupManager) DeleteZoneForPodGroup(pgFullName string) {
+	pgMgr.groupByPG.Delete(pgFullName)
 }
 
 // CheckClusterResource checks if resource capacity of the cluster can satisfy <resourceRequest>.

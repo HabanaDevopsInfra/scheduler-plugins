@@ -110,6 +110,18 @@ const (
 
 	// PodGroupLabel is the default label of coscheduling
 	PodGroupLabel = scheduling.GroupName + "/pod-group"
+
+	// PodGroupGroupBy is an annotation that allows grouping of nodes per label for the purpose
+	// of resource calculation per group. i.e example.com/zone
+	PodGroupAnnotationGroupBy = scheduling.GroupName + "/group-by"
+
+	// PodGroupAnnotationGroupResource is the annotation of the resource name to calculate its
+	// availability in each group.
+	PodGroupAnnotationGroupResource = scheduling.GroupName + "/group-resource"
+
+	// PodGroupAnnotationExclude is an annotation that allows excluding nodes from the group calculation
+	// by labels.
+	PodGroupAnnotationExclude = scheduling.GroupName + "/exclude"
 )
 
 // PodGroup is a collection of Pod; used for batch workload.
